@@ -1,0 +1,34 @@
+# 编译产物
+bin/
+build.log
+*.obj
+*.pdb
+*.lib
+*.exp
+!thirdparty/webview2/x86/WebView2LoaderStatic.lib
+
+# IDE / 系统
+.vs/
+*.user
+*.aps
+Thumbs.db
+
+# 易语言本机部署副本与备份（勿提交）
+*.fne.bak_*
+JadeDesigner.bak_*
+
+# Additional local build outputs
+out/
+build/
+Debug/
+Release/
+*.fne
+*.dll
+*.ilk
+*.iobj
+*.ipdb
+*.recipe
+*.tlog/
+*.lastbuildstate
+*.log
+*.cache

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="src"><UniqueIdentifier>{0596602C-9F10-4DE2-BE0C-4AA7E5DA4C43}</UniqueIdentifier></Filter>
+    <Filter Include="elib"><UniqueIdentifier>{AC89CC76-C75F-4F3F-BCB2-2912164B0D5A}</UniqueIdentifier></Filter>
+    <Filter Include="thirdparty"><UniqueIdentifier>{21939F85-F76A-4030-BCA8-97EA3378FB49}</UniqueIdentifier></Filter>
+    <Filter Include="web"><UniqueIdentifier>{7CF1DB00-0CE3-440A-A102-FE862532DAA7}</UniqueIdentifier></Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="elib\fnshare.cpp"><Filter>elib</Filter></ClCompile>
+    <ClCompile Include="src\DesignerLog.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\IDEIntegration.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\IdeEventRouter.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\PluginEntry.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\WebPreview.cpp"><Filter>src</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="elib\fnshare.h"><Filter>elib</Filter></ClInclude>
+    <ClInclude Include="elib\krnllib.h"><Filter>elib</Filter></ClInclude>
+    <ClInclude Include="elib\lang.h"><Filter>elib</Filter></ClInclude>
+    <ClInclude Include="elib\lib2.h"><Filter>elib</Filter></ClInclude>
+    <ClInclude Include="elib\mtypes.h"><Filter>elib</Filter></ClInclude>
+    <ClInclude Include="elib\PublicIDEFunctions.h"><Filter>elib</Filter></ClInclude>
+    <ClInclude Include="elib\untshare.h"><Filter>elib</Filter></ClInclude>
+    <ClInclude Include="src\DesignerLog.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\IDEIntegration.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\IdeEventRouter.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\WebPreview.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="thirdparty\WebView2.h"><Filter>thirdparty</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\JadeDesigner.def"><Filter>src</Filter></None>
+    <None Include="thirdparty\webview2\x86\WebView2LoaderStatic.lib"><Filter>thirdparty</Filter></None>
+    <None Include="web\index.html"><Filter>web</Filter></None>
+  </ItemGroup>
+</Project>
