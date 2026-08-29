@@ -1,7 +1,9 @@
-# JadeDesigner 架构深档（1.6.9）
+# JadeDesigner 内存桥接版架构深档（JadeHybrid 0.3）
 
 更新：2026-08-28。本文记录插件每一部分"怎么做到的"、支撑它的 e5.95 逆向证据、
 以及踩过的全部坑——后续维护或移植到其他易语言版本前必读。
+
+> **分支说明：内存桥接**：本分支的程序集/代码写入不是完全依赖公开 IDE API，而是由 `HookBridge` 动态加载配套 `jadehook.dll`，调用 `JadeHookGenerateAssembly` 与 `JadeHookInsertAnsi` 在运行中的 IDE 进程内完成。`jadehook.dll` 不随本仓库提交。
 
 ---
 
@@ -17,12 +19,13 @@
 │   │    └─ MDI 文档"Jade预览" ← WebPreview 创建                          │
 │   └─ CCustomTabCtrl (id 59392) ← 底部页签（插件注入"Jade预览"标签）       │
 │                                                                        │
-│  JadeDesigner.fne（本插件）                                            │
+│  JadeHybrid.fne（本插件，内部模块名保留 JadeHybrid）                                            │
 │   ├─ PluginEntry   GetNewInf / NL_* 消息 → 附加 IDE                     │
 │   ├─ IDEIntegration 找主窗口/页签/MDI 客户区，注入标签与菜单              │
 │   ├─ WebPreview    WebView2 环境 → Controller → 预览 MDI 页              │
 │   │      ▲ WebMessageReceived（事件上行） / ExecuteScript（桥安装）      │
-│   └─ IdeEventRouter 接收 JADE_EVT → 定位/创建 程序集+子程序 → 跳转        │
+│   ├─ IdeEventRouter 接收 JADE_EVT → 定位/创建 程序集+子程序 → 跳转        │
+│   └─ HookBridge 动态加载 jadehook.dll → 内存桥接程序集/代码写入       │
 │          │ 全部通过 NotifySys(NES_RUN_FUNC, FN_xxx, 参数) 公开接口        │
 └────────────────────────────────────────────────────────────────────────┘
 ```

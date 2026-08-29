@@ -81,7 +81,7 @@ LIB_INFOX BuildLibraryInfo()
     info.m_nRqSysKrnlLibMinorVer = 3;
     info.m_szName = "JadeHybrid";
     info.m_nLanguage = __GBK_LANG_VER;
-    info.m_szExplain = "JadeDesigner hybrid hook experiment for E-language IDE 5.95.";
+    info.m_szExplain = "JadeDesigner in-memory bridge version for E-language IDE 5.95.";
     info.m_dwState = LBS_IDE_PLUGIN | LBS_LIB_INFO2 | LBS_FUNC_NO_RUN_CODE;
     info.m_szAuthor = "JadeDesigner";
     info.m_nDataTypeCount = 0;
@@ -150,7 +150,7 @@ extern "C" INT WINAPI JadeDesigner_MessageNotify(INT message, DWORD parameter1, 
 extern "C" __declspec(dllexport) PLIB_INFOX WINAPI GetNewInf()
 {
     EnsureModulesInitialized();
-    DesignerLog::Write("GetNewInf called; JadeHybrid 0.3 (HOOK_FIXED_APPEND)");
+    DesignerLog::Write("GetNewInf called; JadeHybrid 0.3 (IN_MEMORY_HOOK_FIXED_APPEND)");
     g_libraryInfo.m_pfnNotify = JadeDesigner_MessageNotify;
     return &g_libraryInfo;
 }
