@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>JadeDesigner 实时预览</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --primary: #2563eb;
+      --primary-dark: #1d4ed8;
+      --surface: #ffffff;
+      --background: #f4f7fb;
+      --border: #dbe3ef;
+      --text: #172033;
+      --muted: #64748b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 36px;
+      background:
+        radial-gradient(circle at 15% 0%, rgba(37, 99, 235, .13), transparent 36%),
+        var(--background);
+      color: var(--text);
+      font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+    }
+    .shell { width: min(920px, 100%); margin: 0 auto; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border: 1px solid #bfdbfe;
+      border-radius: 999px;
+      background: #eff6ff;
+      color: var(--primary-dark);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 4px #dcfce7; }
+    h1 { margin: 20px 0 10px; font-size: clamp(28px, 5vw, 44px); letter-spacing: -.04em; }
+    .lead { margin: 0 0 28px; color: var(--muted); font-size: 17px; line-height: 1.8; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+    .card {
+      padding: 24px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, .92);
+      box-shadow: 0 14px 35px rgba(30, 55, 90, .08);
+    }
+    .card h2 { margin: 0 0 10px; font-size: 18px; }
+    .card p { margin: 0; color: var(--muted); line-height: 1.7; }
+    button {
+      width: 100%;
+      margin-top: 18px;
+      padding: 13px 18px;
+      border: 0;
+      border-radius: 11px;
+      background: var(--primary);
+      color: #fff;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform .15s ease, background .15s ease;
+    }
+    button:hover { background: var(--primary-dark); transform: translateY(-1px); }
+    .field { margin-top: 16px; }
+    .field > label { display: block; margin-bottom: 7px; color: var(--muted); font-size: 13px; font-weight: 700; }
+    select {
+      width: 100%;
+      padding: 11px 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+    }
+    .radio-row { display: flex; gap: 18px; align-items: center; }
+    .radio-row label { color: var(--text); font-size: 14px; }
+    .shared-button { background: #dc2626; }
+    .shared-button:hover { background: #b91c1c; }
+    #eventLog {
+      min-height: 48px;
+      margin-top: 18px;
+      padding: 13px 15px;
+      border-radius: 11px;
+      background: #0f172a;
+      color: #dbeafe;
+      font-family: Consolas, monospace;
+      line-height: 1.6;
+    }
+    @media (max-width: 700px) { body { padding: 22px; } .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="badge"><span class="dot"></span>易语言 5.95 · WebView2 已连接</div>
+    <h1>JadeDesigner 实时预览</h1>
+    <p class="lead">网页按钮、选择框和单选框已连接易语言事件路由：已有子程序会直接跳转，没有时会在约定的程序集中新建。</p>
+    <section class="grid">
+      <article class="card">
+        <h2>热更新测试</h2>
+        <p>随便修改标题、颜色或布局，然后按 Ctrl+S，预览将在约 600 毫秒内刷新。</p>
+      </article>
+      <article class="card">
+        <h2>UI 事件路由测试</h2>
+        <p>普通事件进入“Jade通讯注册事件”；公共 UI 事件可以明确路由到“UI_JadeView”。</p>
+        <button id="按钮1" type="button">按钮1</button>
+        <div class="field">
+          <label for="主题选择框">选择框</label>
+          <select id="主题选择框">
+            <option value="浅色">浅色</option>
+            <option value="深色">深色</option>
+          </select>
+        </div>
+        <div class="field">
+          <span class="field-label">单选框</span>
+          <div class="radio-row">
+            <label><input id="布局模式_紧凑" name="布局模式" type="radio" value="紧凑" checked> 紧凑</label>
+            <label><input id="布局模式_宽松" name="布局模式" type="radio" value="宽松"> 宽松</label>
+          </div>
+        </div>
+        <button class="shared-button" id="窗口最小化" type="button"
+                data-jade-handler="ipc_窗口最小化"
+                data-jade-assembly="UI_JadeView">公共 UI：窗口最小化</button>
+        <button id="订阅窗口最小化" type="button"
+                data-jade-call="JadeView.通讯.订阅"
+                data-jade-channel="win:minimize"
+                data-jade-handler="ipc_窗口最小化">
+          JadeView.通讯.订阅 win:minimize</button>
+        <button id="注册应用就绪" type="button"
+                data-jade-call="JadeView.App.注册事件"
+                data-jade-event="应用准备就绪"
+                data-jade-handler="UI_就绪回调">
+          JadeView.App.注册事件 应用准备就绪</button>
+        <div id="eventLog" data-jade-status>等待 UI 事件…</div>
+      </article>
+    </section>
+  </main>
+  <script>
+    // 事件桥由 JadeDesigner 插件在页面加载完成后自动注入（含 jade 预览桩、
+    // 点击/变化捕获与 JadeView.通讯.订阅 生成），页面里无需自行实现。
+    const button = document.getElementById('按钮1');
+    const eventLog = document.getElementById('eventLog');
+    let count = 0;
+
+    if (button && eventLog) {
+      button.addEventListener('click', () => {
+        count += 1;
+        eventLog.textContent = `按钮1被单击 · 第 ${count} 次 · ${new Date().toLocaleTimeString()}`;
+      });
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,56 @@
+# 编译产物
+bin/
+build.log
+*.obj
+*.pdb
+*.lib
+*.exp
+!thirdparty/webview2/x86/WebView2LoaderStatic.lib
+
+# IDE / 系统
+.vs/
+*.user
+*.aps
+Thumbs.db
+
+# 易语言本机部署副本与备份（勿提交）
+*.fne.bak_*
+JadeDesigner.bak_*
+
+# Additional local build outputs
+out/
+build/
+Debug/
+Release/
+*.fne
+*.dll
+*.ilk
+*.iobj
+*.ipdb
+*.recipe
+*.tlog/
+*.lastbuildstate
+*.log
+*.cache
+
+# Local verification, private fixtures and machine-specific evidence
+/artifacts/
+/work/
+*.e
+*.exe
+*.dmp
+*.zip
+*.bak
+*.bak_*
+*.clean.bak
+.env
+.env.*
+*.pem
+*.key
+
+# Historical mixed-version notes and unused standalone loader stay local
+/ARCHITECTURE.md
+/jadehook/src/jadehook_loader.cpp
+/docs/*
+!/docs/AI提示词_HTML控件命名规范.md
+!/docs/0908版本说明.md
