@@ -84,6 +84,15 @@
     <ClInclude Include="elib\PublicIDEFunctions.h" />
     <ClInclude Include="elib\untshare.h" />
     <ClInclude Include="src\DesignerLog.h" />
+    <ClInclude Include="src\DesignerInspection.h" />
+    <ClInclude Include="src\DesignerText.h" />
+    <ClInclude Include="src\DesignerVisual.h" />
+    <ClInclude Include="src\NativeToolbox.h" />
+    <ClInclude Include="src\DesignerToolsScript.h" />
+    <ClInclude Include="src\RuntimeDiagnosticsScript.h" />
+    <ClInclude Include="src\DiagnosticsInstall.h" />
+    <ClInclude Include="src\ProjectHealth.h" />
+    <ClInclude Include="src\CommonCode.h" />
     <ClInclude Include="src\IDEIntegration.h" />
     <ClInclude Include="src\IdeEventRouter.h" />
     <ClInclude Include="src\ProjectAssembly.h" />

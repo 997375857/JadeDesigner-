@@ -6,6 +6,9 @@ namespace HookBridge {
 
 enum class BackgroundChange { Unknown, CallbackCreated, SubscriptionRepaired };
 
+int EnsureCommon(const std::string& name, const std::string& source,
+    const std::string& subscription, const std::string& fixed, std::string& error);
+
 // Result: 1 created/repaired without activating a code page, 2 already complete,
 // -1 refused/failed. All strings are GBK; generated statements are verified.
 int EnsureBackground(const std::string& callbackAssembly, const std::string& assembly, const std::string& fixed,
@@ -27,6 +30,10 @@ struct HostInfo {
 };
 
 HostInfo InspectHost();
+
+// 1: unique assembly read; 0: proven absent; -1: unavailable/ambiguous.
+int ReadAssembly(const std::string& nameAnsi, std::string& sourceUtf8, std::string& error);
+int ReadRoutine(const std::string& nameAnsi, std::string& sourceUtf8, std::string& error);
 
 bool GenerateAssembly(
     const std::string& assemblyAnsi,

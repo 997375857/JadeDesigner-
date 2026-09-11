@@ -4,6 +4,8 @@
 
 #include <string>
 #include <string_view>
+#include "CommonCode.h"
+#include "ProjectHealth.h"
 
 namespace IdeEventRouter {
 
@@ -33,6 +35,14 @@ struct RouteResult {
 std::string DecodeWireField(std::wstring_view value);
 bool TryParseWebMessage(std::wstring_view wireMessage, UiEvent& event);
 RouteResult Route(HWND mainWindow, HWND mdiClient, const UiEvent& event);
+RouteResult GenerateCommonCode(HWND mainWindow, CommonCode::Options options = {});
+struct BindingInfo { UiEvent normalized; std::string status, message; };
+BindingInfo InspectBinding(const UiEvent& event);
+RouteResult OperateBinding(HWND mainWindow, HWND mdiClient, const UiEvent& event, bool locateOnly);
+struct CommonPreview { bool ready = false; CommonCode::Options options; std::string source, existing, report; };
+CommonPreview PreviewCommonCode(HWND mainWindow, CommonCode::Options options);
+std::vector<ProjectHealth::Check> InspectProjectHealth();
+void ToggleNativeComponentBar();
 std::wstring BuildAckMessage(const RouteResult& result);
 
 } // namespace IdeEventRouter

@@ -14,14 +14,18 @@ int wmain(int argc, wchar_t** argv)
     auto generate = reinterpret_cast<BOOL(WINAPI*)(const char*, const char*, const char*)>(GetProcAddress(module, "_JadeHookGenerateAssembly@12"));
     auto reason = reinterpret_cast<const char*(WINAPI*)()>(GetProcAddress(module, "_JadeHookLastReason@0"));
     auto readAssembly = reinterpret_cast<int(WINAPI*)(const char*,char*,int)>(GetProcAddress(module,"_JadeHookReadAssemblyCode@12"));
+    auto readRoutine = reinterpret_cast<int(WINAPI*)(const char*,char*,int)>(GetProcAddress(module,"_JadeHookReadRoutineCode@12"));
     auto ensure = reinterpret_cast<int(WINAPI*)(const char*,const char*,const char*,const char*,const char*,const char*)>(GetProcAddress(module,"_JadeHookEnsureBackgroundAnsi@24"));
-    if (!version || !probe || !read || !write || !generate || !reason || !readAssembly || !ensure) return 4;
+    auto common = reinterpret_cast<int(WINAPI*)(const char*,const char*,const char*,const char*)>(GetProcAddress(module,"_JadeHookEnsureCommonAnsi@16"));
+    if (!version || !probe || !read || !write || !generate || !reason || !readAssembly || !readRoutine || !ensure || !common) return 4;
     char buffer[32] = "untouched";
     const bool ok = version() == 3 && !probe() && read(buffer, sizeof(buffer)) == -1 &&
         !std::strcmp(buffer, "untouched") && !write(".sub\r\n") &&
         !generate("test", "test", "test") &&
         readAssembly("test",buffer,sizeof(buffer)) == -1 && !std::strcmp(buffer,"untouched") &&
+        readRoutine("test",buffer,sizeof(buffer)) == -1 && !std::strcmp(buffer,"untouched") &&
         ensure("test","test","fixed","handler","statement","callback") == -1 &&
+        common("test","source","subscriptions","fixed") == -1 &&
         !std::strcmp(reason(), "memory_host_fingerprint_mismatch");
     FreeLibrary(module);
     std::puts(ok ? "Memory bridge API and unsupported-host guards passed" : "FAILED memory bridge contract");

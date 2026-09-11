@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <utility>
 #pragma comment(lib, "advapi32.lib")
 
@@ -183,7 +184,13 @@ bool ParseAndCommit(uintptr_t editor, const char* source, size_t length) {
     return true;
 }
 #include "background_model.inl"
+#include "common_model.inl"
 } // namespace
+extern "C" __declspec(dllexport) int WINAPI JadeHookEnsureCommonAnsi(
+    const char* name, const char* source, const char* subscription, const char* fixed) {
+    Operation op; if (!op.entered) return -1;
+    return EnsureCommon(name,source,subscription,fixed);
+}
 extern "C" __declspec(dllexport) DWORD WINAPI JadeHookMemoryApiVersion() { return 3; }
 extern "C" __declspec(dllexport) int WINAPI JadeHookEnsureBackgroundAnsi(
     const char* callbackAssembly, const char* assembly, const char* fixed, const char* handler, const char* statement, const char* callback) {
@@ -205,6 +212,21 @@ extern "C" __declspec(dllexport) int WINAPI JadeHookReadAssemblyCode(const char*
     if (!buffer || capacity <= length) return length;
     memcpy(buffer,utf8.c_str(),utf8.size()+1);
     Reason("background_model_read_success"); return length;
+}
+extern "C" __declspec(dllexport) int WINAPI JadeHookReadRoutineCode(const char* name, char* buffer, int capacity) {
+    Operation op; if (!op.entered) return -1;
+    if (!name || !*name) { Reason("health_invalid_routine_name"); return -1; }
+    ModelItem routine;
+    const int copies=FindModel(Project()+612,name,routine);
+    if (!copies) { Reason("health_routine_absent"); return 0; }
+    if (copies!=1) { Reason("health_routine_ambiguous"); return -1; }
+    Buffer text; std::string ansi,utf8;
+    SerializeSub(routine,text);
+    if (!BufferString(text,ansi) || !Utf8(ansi,utf8)) { Reason("health_routine_read_failed"); return -1; }
+    const int length=static_cast<int>(utf8.size());
+    if (!buffer || capacity<=length) return length;
+    memcpy(buffer,utf8.c_str(),utf8.size()+1);
+    Reason("health_routine_read_success"); return length;
 }
 extern "C" __declspec(dllexport) const char* WINAPI JadeHookLastReason() { return g_reason; }
 extern "C" __declspec(dllexport) BOOL WINAPI JadeHookProbe() { return SupportedHost(); }

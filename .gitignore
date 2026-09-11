@@ -1,5 +1,6 @@
 # 编译产物
 bin/
+node_modules/
 build.log
 *.obj
 *.pdb

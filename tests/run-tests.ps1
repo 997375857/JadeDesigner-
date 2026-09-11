@@ -24,4 +24,25 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Bridge contract build failed' }
     & $contractExe $hook
     if ($LASTEXITCODE -ne 0) { throw 'Bridge contract tests failed' }
+    $commonSource = Join-Path $PSScriptRoot 'CommonCodeTests.cpp'
+    $commonExe = Join-Path $out 'CommonCodeTests.exe'
+    $commonCompile = 'call "{0}" >nul && cl /nologo /std:c++20 /EHsc /W4 /WX /utf-8 "{1}" /Fe:"{2}"' -f $vcvars,$commonSource,$commonExe
+    & cmd.exe /d /s /c $commonCompile
+    if ($LASTEXITCODE -ne 0) { throw 'Common template test build failed' }
+    & $commonExe
+    if ($LASTEXITCODE -ne 0) { throw 'Common template tests failed' }
+    $designerSource = Join-Path $PSScriptRoot 'DesignerToolsTests.cpp'
+    $designerExe = Join-Path $out 'DesignerToolsTests.exe'
+    $designerCompile = 'call "{0}" >nul && cl /nologo /std:c++20 /EHsc /W4 /WX /utf-8 /DNOMINMAX "{1}" /Fe:"{2}"' -f $vcvars,$designerSource,$designerExe
+    & cmd.exe /d /s /c $designerCompile
+    if ($LASTEXITCODE -ne 0) { throw 'Designer tools test build failed' }
+    & $designerExe
+    if ($LASTEXITCODE -ne 0) { throw 'Designer tools tests failed' }
+    $toolboxSource = Join-Path $PSScriptRoot 'NativeToolboxTests.cpp'
+    $toolboxExe = Join-Path $out 'NativeToolboxTests.exe'
+    $toolboxCompile = 'call "{0}" >nul && cl /nologo /std:c++20 /EHsc /W4 /WX /utf-8 /DNOMINMAX /DUNICODE /D_UNICODE "{1}" /Fe:"{2}" /link user32.lib gdi32.lib comctl32.lib' -f $vcvars,$toolboxSource,$toolboxExe
+    & cmd.exe /d /s /c $toolboxCompile
+    if ($LASTEXITCODE -ne 0) { throw 'Native toolbox test build failed' }
+    & $toolboxExe
+    if ($LASTEXITCODE -ne 0) { throw 'Native toolbox tests failed' }
 } finally { Pop-Location }

@@ -128,6 +128,21 @@ GenerateAssemblyFn ResolveGenerate(std::string& error)
 
 namespace HookBridge {
 
+int EnsureCommon(const std::string& name, const std::string& source,
+    const std::string& subscription, const std::string& fixed, std::string& error)
+{
+    HMODULE module = HookModule(error);
+    if (!module) return -1;
+    using Fn = int(WINAPI*)(const char*,const char*,const char*,const char*);
+    auto ensure = reinterpret_cast<Fn>(ResolveExport(module,
+        "JadeHookEnsureCommonAnsi", "_JadeHookEnsureCommonAnsi@16"));
+    if (!ensure) { error = "common_export_missing_replace_jadehook_dll"; return -1; }
+    const int result = ensure(name.c_str(),source.c_str(),subscription.c_str(),fixed.c_str());
+    error = LastReason(module,"common_operation_failed");
+    DesignerLog::Write("COMMON ensure result=" + std::to_string(result) + " reason=\"" + error + "\"");
+    return result;
+}
+
 int EnsureBackground(const std::string& callbackAssembly, const std::string& assembly, const std::string& fixed,
     const std::string& handler, const std::string& statement,
     const std::string& callback, std::string& error, BackgroundChange& change)
@@ -255,5 +270,28 @@ bool ReadPageCode(std::string& pageUtf8, std::string& error)
     error = "page code kept growing between reads";
     return false;
 }
+
+static int ReadNamed(const std::string& name, std::string& source, std::string& error, bool routine)
+{
+    source.clear(); error.clear();
+    if (!InspectHost().ok()) { error = "unsupported_host"; return -1; }
+    HMODULE module = HookModule(error);
+    if (!module) return -1;
+    using ReadFn = int(WINAPI*)(const char*, char*, int);
+    const auto read = reinterpret_cast<ReadFn>(ResolveExport(module,
+        routine?"JadeHookReadRoutineCode":"JadeHookReadAssemblyCode", routine?"_JadeHookReadRoutineCode@12":"_JadeHookReadAssemblyCode@12"));
+    if (!read) { error = routine?"routine_read_export_missing_replace_jadehook_dll":"assembly_read_export_missing"; return -1; }
+    std::string buffer(kInitialPageBufferBytes, '\0');
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const int n = read(name.c_str(), buffer.data(), static_cast<int>(buffer.size()));
+        if (n < 0 || n > 8 * 1024 * 1024) { error = LastReason(module,"assembly_read_failed"); return -1; }
+        if (!n) return 0;
+        if (static_cast<size_t>(n) < buffer.size()) { buffer.resize(n); source.swap(buffer); return 1; }
+        buffer.assign(static_cast<size_t>(n) + 1, '\0');
+    }
+    error = "assembly_changed_during_read"; return -1;
+}
+int ReadAssembly(const std::string& name,std::string& source,std::string& error) { return ReadNamed(name,source,error,false); }
+int ReadRoutine(const std::string& name,std::string& source,std::string& error) { return ReadNamed(name,source,error,true); }
 
 } // namespace HookBridge

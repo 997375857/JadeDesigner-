@@ -2519,7 +2519,176 @@ PageEnsureResult EnsureAssemblySubPage(
 
 } // namespace
 
+#include "CommonCode.h"
+#include "DesignerInspection.h"
+
 namespace IdeEventRouter {
+
+void ToggleNativeComponentBar() { InvokeIde(FN_SWITCH_UNIT_BAR); }
+
+std::vector<ProjectHealth::Check> InspectProjectHealth()
+{
+    const auto host=HookBridge::InspectHost();
+    if(!host.ok())return {{"error","IDE 兼容性","请使用配套的 e5.95.exe，当前为 "+host.exeNameUtf8}};
+    auto checks=ProjectHealth::Inspect(
+        [](const auto& name,auto& text,auto& error){return HookBridge::ReadAssembly(WideToAnsi(Utf8ToWide(name)),text,error);},
+        [](const auto& name,auto& text,auto& error){return HookBridge::ReadRoutine(WideToAnsi(Utf8ToWide(name)),text,error);});
+    checks.insert(checks.begin(),{"ok","IDE 兼容性","内存桥宿主检查通过"});
+    return checks;
+}
+
+BindingInfo InspectBinding(const UiEvent& event)
+{
+    BindingInfo info{event,"unknown",{}};
+    if (IsWindowControlEvent(event) || event.callType == "JadeView.App.注册事件") {
+        info.message="窗口控制或原生生命周期事件，不在普通控件修复范围"; return info;
+    }
+    if (event.handlerName.empty() && event.callType.empty()) {
+        info.message="缺少稳定回调名称"; return info;
+    }
+    auto handler=Utf8ToWide(event.handlerName);
+    if (handler.empty() && event.callType=="JadeView.通讯.订阅" && !event.callParam.empty())
+        handler=DeriveIpcNameFromChannel(Utf8ToWide(event.callParam));
+    if (handler.empty() && IsCommonInteractiveControl(event) && !event.elementId.empty())
+        handler=Utf8ToWide(event.elementId)+DefaultHandlerSuffix(event);
+    handler=SanitizeIdentifier(handler,L"Jade事件");
+    auto assembly=event.assemblyName.empty() ? std::wstring() : SanitizeIdentifier(Utf8ToWide(event.assemblyName),kSubscribeAssembly);
+    if (assembly.empty()) assembly=StartsWithInsensitive(handler,L"ipc_") || StartsWithInsensitive(handler,L"UI_") ? kSharedAssembly : kSubscribeAssembly;
+    info.normalized.handlerName=WideToUtf8(handler);
+    info.normalized.assemblyName=WideToUtf8(assembly);
+    info.normalized.callParam=event.callParam.empty() ? "ui:"+event.elementId : event.callParam;
+    std::string source, subscriptions, error;
+    const int read=HookBridge::ReadAssembly(WideToAnsi(assembly),source,error);
+    const int subRead=assembly==kSubscribeAssembly ? read : HookBridge::ReadAssembly(WideToAnsi(kSubscribeAssembly),subscriptions,error);
+    if (assembly==kSubscribeAssembly) subscriptions=source;
+    if (read<0 || subRead<0) { info.message="内存读取未完成："+error; return info; }
+    const auto routines=DesignerInspection::Routines(source);
+    const int copies=DesignerInspection::Count(routines,info.normalized.handlerName);
+    const auto subs=DesignerInspection::Routines(subscriptions);
+    if (copies>1 || DesignerInspection::Count(subs,WideToUtf8(kSubscribeSub))>1) {
+        info.status="conflict"; info.message="同名子程序重复，未自动修改"; return info;
+    }
+    std::string block;
+    for(const auto& routine:subs) if(routine.name==WideToUtf8(kSubscribeSub)) block=routine.source;
+    int exact=0; bool conflicting=false;
+    std::istringstream lines(block); std::string line;
+    while(std::getline(lines,line)) {
+        std::string channel,target;
+        if(!DesignerInspection::Subscription(line,channel,target) || channel!=info.normalized.callParam) continue;
+        if (_stricmp(target.c_str(),info.normalized.handlerName.c_str())==0) ++exact;
+        else conflicting=true;
+    }
+    if (exact>1 || conflicting) { info.status="conflict"; info.message="订阅重复或同一频道指向其他回调"; }
+    else if (copies==1 && exact==1) { info.status="complete"; info.message="回调与订阅均已存在"; }
+    else { info.status="missing"; info.message=copies==0 ? "缺少回调或程序集" : "缺少订阅"; }
+    return info;
+}
+
+RouteResult OperateBinding(HWND mainWindow, HWND mdiClient, const UiEvent& event, bool locateOnly)
+{
+    const auto current=InspectBinding(event);
+    if (locateOnly) {
+        if(current.status!="complete" && current.status!="missing") return Fail("inspect",current.message);
+        std::string source,error;
+        if(HookBridge::ReadAssembly(WideToAnsi(Utf8ToWide(current.normalized.assemblyName)),source,error)!=1 ||
+            DesignerInspection::Count(DesignerInspection::Routines(source),current.normalized.handlerName)!=1)
+            return Fail("locate","回调不存在或不唯一，未创建代码");
+        const bool ok=ProjectAssembly::JumpToSubroutine(mainWindow,mdiClient,Utf8ToWide(current.normalized.assemblyName),Utf8ToWide(current.normalized.handlerName));
+        return {ok,"locate",ok ? "已定位回调" : "定位未完成，未写入代码"};
+    }
+    if(current.status=="complete") return {true,"preserved","绑定已完整，无需补齐"};
+    if(current.status!="missing") return Fail("repair",current.message);
+    return Route(mainWindow,mdiClient,current.normalized);
+}
+
+CommonPreview PreviewCommonCode(HWND mainWindow, CommonCode::Options options)
+{
+    CommonPreview out;
+    if(options.appId.empty()) {
+        wchar_t title[4096]{}; GetWindowTextW(mainWindow,title,4096); std::wstring path;
+        if(!ExtractProjectPath(title,path)) { out.report="请先保存工程或填写应用标识"; return out; }
+        options.appId=CommonCode::ProjectAppId(path);
+    }
+    out.options=options;
+    out.source=WideToUtf8(CommonCode::BuildSource(options));
+    if(out.source.empty()) { out.report="应用标识不合法"; return out; }
+    std::string error;
+    const int found=HookBridge::ReadAssembly(WideToAnsi(CommonCode::Assembly),out.existing,error);
+    if(found<0) { out.report="公共程序集内存读取失败："+error; return out; }
+    out.ready=found==0;
+    const auto existing=DesignerInspection::Routines(out.existing);
+    for(const auto& r:DesignerInspection::Routines(out.source)) {
+        const int n=DesignerInspection::Count(existing,r.name);
+        out.report += (n==0 ? "新增候选：" : n==1 ? "保留现有：" : "重复冲突：")+r.name+"\n";
+    }
+    if(found) out.report += "已有公共代码：仅提供新旧对照，禁止整页覆盖。请人工合并差异。\n";
+    struct Requirement { const wchar_t* type; const char* method; int count; };
+    std::vector<Requirement> requirements={
+        {L"_JadeViewApp","初始化",6},{L"_JadeViewApp","注册事件",2},{L"_JadeViewApp","消息循环",0},{L"_JadeViewApp","退出",0},
+        {L"_JadeView_窗口","创建",4},{L"_JadeView_窗口","最小化",1},{L"_JadeView_窗口","最大化切换",1},{L"_JadeView_窗口","销毁",1},
+        {L"_JadeView_IPC","订阅",2},{L"_JadeView_自定义协议服务","创建服务",2}};
+    if(options.tray || options.singleInstance) {
+        requirements.push_back({L"_JadeView_窗口","设置窗口显示或隐藏",2});
+        requirements.push_back({L"_JadeView_窗口","设置焦点",1});
+    }
+    if(options.tray) {
+        for(auto name:{"创建","销毁","显示图标","设置图标","设置提示文本","设置菜单项"})
+            requirements.push_back({L"_JadeView_托盘",name,std::string(name)=="创建" ? 0 : (std::string(name)=="销毁" || std::string(name)=="显示图标" ? 1 : 2)});
+        requirements.push_back({L"类_json","解析",3});
+        requirements.push_back({L"类_json","取通用属性",2});
+        requirements.push_back({L"类_json","取属性数值",1});
+    }
+    std::map<std::wstring,std::string> modules;
+    for(const auto& r:requirements) {
+        if(!modules.contains(r.type)) {
+            std::string text;
+            if(HookBridge::ReadAssembly(WideToAnsi(r.type),text,error)!=1) text.clear();
+            modules.emplace(r.type,std::move(text));
+        }
+        if(!DesignerInspection::Method(modules[r.type],r.method,r.count)) {
+            out.ready=false;
+            out.report += "缺少或签名不匹配："+WideToUtf8(r.type)+"."+r.method+"（参数 "+std::to_string(r.count)+" 个）\n";
+        }
+    }
+    out.report += "检查范围：当前工程内存中的方法名称和参数数量；运行 DLL 版本及实际行为仍需运行验证。\n";
+    return out;
+}
+
+RouteResult GenerateCommonCode(HWND mainWindow, CommonCode::Options options)
+{
+    if (!IsWindow(mainWindow)) return Fail("common", "易语言窗口尚未准备好");
+    if (g_routingInProgress.exchange(true)) return Fail("common", "正在处理其他操作，请稍后重试");
+    RoutingGuard guard;
+    ResetSessionCachesIfProjectChanged(mainWindow);
+    if (!HookBridge::InspectHost().ok()) return Fail("common", "请使用配套的 e5.95.exe 打开项目");
+    if (options.appId.empty()) {
+        wchar_t title[4096]{};
+        GetWindowTextW(mainWindow,title,4096);
+        std::wstring projectPath;
+        if (!ExtractProjectPath(title,projectPath)) return Fail("common", "请先保存工程，或填写独立应用标识。");
+        options.appId = CommonCode::ProjectAppId(projectPath);
+    }
+    const std::wstring source = CommonCode::BuildSource(options);
+    if (source.empty()) return Fail("common", "应用标识需要 6～64 位英文字母、数字、下划线或短横线。");
+    std::string reason;
+    const int result = HookBridge::EnsureCommon(WideToAnsi(CommonCode::Assembly),
+        WideToAnsi(source), WideToAnsi(CommonCode::SubscriptionAssembly),
+        WideToAnsi(CommonCode::SubscriptionRoutine), reason);
+    if (result == 1) return {true, "common_created",
+        std::string("公共代码已创建；在现有启动入口调用 Jade_公共_启动 ()。已有入口未修改。") +
+        ((options.tray || options.singleInstance) ? "窗口恢复要求 JadeView DLL 2.3 或更新。" : "") +
+        (options.tray ? "托盘需类_json及程序目录 app.ico，失败时正常关闭退出。" : "")};
+    if (result == 2) return {true, "common_exists", "公共代码已存在，保留你的修改，未重复生成。"};
+    if (reason == "common_profile_conflict") return Fail("common",
+        "已有公共代码与所选配置不同，未覆盖。请保留原代码并人工合并；尚未修改的新生成代码可撤销后重选。" );
+    if (reason == "common_json_dependency_missing") return Fail("common",
+        "托盘需要类_json，当前工程未找到。请先导入提供该类的精易模块，再生成；工程未修改。");
+    if (reason == "common_window_channel_conflict") return Fail("common",
+        "已有 win:minimize / win:maximize / win:close 通道代码，已停止生成，避免覆盖原有窗口行为。" );
+    if (reason.find("conflict") != std::string::npos || reason == "common_existing_incomplete")
+        return Fail("common", "已有同名子程序或不完整的公共程序集，未覆盖。请查看 JadeDesigner.log。");
+    return Fail("common", "公共代码未生成，请确认已导入 JadeView.ec 并使用配套 DLL。原因：" + reason);
+}
 
 std::string DecodeWireField(std::wstring_view value)
 {
@@ -2765,6 +2934,13 @@ RouteResult Route(HWND mainWindow, HWND mdiClient, const UiEvent& event)
     if (background != 2) {
         return Fail("create_background", "后台创建未完成，未改用跳转创建：" + backgroundError);
     }
+    // The background model has already serialized and verified the complete
+    // callback and its subscription before returning 2. The old path treated
+    // that result as permission to re-read the visible page and repair the
+    // body; on a folded or stale page read it saw msg/return as absent and
+    // appended a second pair. Keep the later jump path, but never repair a
+    // callback that the model has proved complete.
+    const bool backgroundAlreadyComplete = background == 2;
 
     // A closed code page is not evidence that its assembly was deleted.
     auto subscriptionAssembly = LookupAssemblyPage(mainWindow, mdiClient, kSubscribeAssembly);
@@ -2920,7 +3096,7 @@ RouteResult Route(HWND mainWindow, HWND mdiClient, const UiEvent& event)
     // Set only when the hook pasted the whole .子程序/.参数/函数体 block during
     // this event. That text went through the IDE's own parser, so the body is
     // complete by construction and must not be re-derived from a page read.
-    bool hookWroteFullBlock = false;
+    bool hookWroteFullBlock = backgroundAlreadyComplete;
     const bool callbackInSubscribeAssembly =
         _wcsicmp(assembly.c_str(), kSubscribeAssembly) == 0;
     // A plain grid scan reports a callback the IDE has not materialised as
