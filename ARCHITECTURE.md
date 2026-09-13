@@ -156,7 +156,7 @@ JADE_EVT \t domEvent \t controlType \t elementId \t value \t checked \t handlerN
 6. **SendInput 模拟 F2/Ctrl+A/输入/回车 的单元格改名**（1.6.5）：手工可行但插件内时序脆弱，
    且会抢用户键盘；被 4.4 的纯 API 方案取代。
 
-## 7. 日志标记速查（`%E_LANG_HOME%\lib\JadeDesigner.log`）
+## 7. 日志标记速查（?????? `JadeDesigner_<???>.log`）
 
 | 标记 | 含义 |
 | --- | --- |

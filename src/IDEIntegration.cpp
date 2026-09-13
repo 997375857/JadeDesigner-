@@ -1,6 +1,7 @@
 #include "IDEIntegration.h"
 
 #include "DesignerLog.h"
+#include "HookBridge.h"
 #include "WebPreview.h"
 
 #include <CommCtrl.h>
@@ -152,9 +153,16 @@ bool Start(HWND mainWindow)
     // sends NL_IDE_READY. Defer MDI/WebView creation until that transition has
     // settled; explicit preview commands still attach immediately.
     SetTimer(mainWindow, kAttachTimerId, kInitialAttachDelayMs, nullptr);
+    // Which executable the plugin is loaded into decides whether the memory
+    // bridge can work at all, and nothing later in the log reveals it: every
+    // hook failure looks the same from the outside.
+    const HookBridge::HostInfo host = HookBridge::InspectHost();
     DesignerLog::Write(
         "IDE start main=" + DesignerLog::HexPointer(mainWindow) +
-        " initial_attach=deferred delay_ms=" + std::to_string(kInitialAttachDelayMs));
+        " initial_attach=deferred delay_ms=" + std::to_string(kInitialAttachDelayMs) +
+        " host=\"" + host.exeNameUtf8 +
+        "\" host_name_ok=" + std::to_string(host.nameSupported ? 1 : 0) +
+        " host_build_ok=" + std::to_string(host.buildSupported ? 1 : 0));
     return true;
 }
 

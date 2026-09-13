@@ -1,5 +1,6 @@
 # 编译产物
 bin/
+node_modules/
 build.log
 *.obj
 *.pdb
@@ -32,3 +33,25 @@ Release/
 *.lastbuildstate
 *.log
 *.cache
+
+# Local verification, private fixtures and machine-specific evidence
+/artifacts/
+/work/
+*.e
+*.exe
+*.dmp
+*.zip
+*.bak
+*.bak_*
+*.clean.bak
+.env
+.env.*
+*.pem
+*.key
+
+# Historical mixed-version notes and unused standalone loader stay local
+/ARCHITECTURE.md
+/jadehook/src/jadehook_loader.cpp
+/docs/*
+!/docs/AI提示词_HTML控件命名规范.md
+!/docs/0908版本说明.md

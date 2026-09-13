@@ -2,7 +2,8 @@
 
 #include "DesignerLog.h"
 #include "HookBridge.h"
-
+#include "ProjectAssembly.h"
+#include "PageSource.h"
 #include <PublicIDEFunctions.h>
 #include <fnshare.h>
 #include <lib2.h>
@@ -20,6 +21,10 @@
 
 namespace {
 
+using PageSource::PageCodeInfo;
+using PageSource::ParsePageCode;
+using PageSource::LeadingIdentifier;
+
 constexpr wchar_t kDefaultAssembly[] = L"Jade通讯注册事件";
 constexpr wchar_t kSharedAssembly[] = L"UI_JadeView";
 constexpr wchar_t kSubscribeAssembly[] = L"Jade_通讯_订阅集";
@@ -29,36 +34,28 @@ constexpr wchar_t kRegisterSub[] = L"UI_启动JadeView";
 constexpr int kMaximumRowsToScan = 4096;
 constexpr int kMaximumColumnsToScan = 4;
 constexpr int kMaximumMissingRowsToStop = 64;
+// Gap tolerance for the rescan used before declaring a subroutine absent.
+// Wider than the everyday heuristic, still bounded: every row costs four IDE
+// round trips.
+constexpr int kThoroughMissingRowsToStop = 192;
 
 // Easy Language 5.95 native menu command identifier, verified from the
 // target e5.95.exe menu resources (SHA256 368CBBD3...ABE1409).
 constexpr UINT kMenuInsertAssembly = 32782; // 0x800E -> FN_INSERT_NEW_MOD
-constexpr UINT kMenuSelectAll = 33009; // 0x80F1
-constexpr UINT kMenuCopy = 57634; // 0xE122
-constexpr UINT kMenuPaste = 57637; // 0xE125
-constexpr DWORD kPasteSettleMs = 300;
 constexpr DWORD kNativeCommandSettleMs = 35;
 constexpr DWORD kInsertSettleMs = 250;
+// e5.95 stores and parses source text as Simplified-Chinese GBK, independent
+// of the Windows process ACP. Keep all bytes crossing the IDE boundary on
+// the explicit code page so UTF-8 is never pasted as mojibake.
+constexpr UINT kIdeCodePage = 936;
 
-// All source-code edits go through the e5.95 public IDE function interface
-// (NotifySys/NES_RUN_FUNC). Reverse-engineering of e5.95.exe (1.6.6 round)
-// confirmed: the FN_GET_PRG_TEXT handler (0x004C4D64) always returns TRUE -
-// even for out-of-range cells - filling type/isTitle but reporting
-// reportedSize = strlen+1 only when a real cell was hit; the IDE's own
-// name-cell commit path (0x0044D0B0) uses FN_SET_AND_COMPILE_PRG_ITEM_TEXT;
-// the editor's '.' keyboard handler (0x004C2290) uses FN_INSERT_TEXT. No
-// clipboard involvement anywhere.
-
-struct KnownAssemblyDocument {
-    std::wstring name;
-    HWND document = nullptr;
-};
-
-std::vector<KnownAssemblyDocument> g_knownAssemblyDocuments;
-
+// Source text uses the native model bridge. Individual navigation and property
+// operations use NotifySys/NES_RUN_FUNC; source reads have no alternate path.
 std::atomic_bool g_routingInProgress{false};
 std::set<std::string> g_writtenSubscriptionKeys;
-
+// Repeated clicks still verify source presence, but avoid the repair path when
+// the current memory snapshot proves both callback and subscription are intact.
+std::set<std::string> g_fastJumpKeys;
 struct RoutingGuard {
     ~RoutingGuard() { g_routingInProgress = false; }
 };
@@ -99,13 +96,13 @@ std::wstring AnsiToWide(std::string_view value)
         return {};
     }
     const int required = MultiByteToWideChar(
-        CP_ACP, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+        kIdeCodePage, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
     if (required <= 0) {
         return {};
     }
     std::wstring result(static_cast<size_t>(required), L'\0');
     MultiByteToWideChar(
-        CP_ACP, 0, value.data(), static_cast<int>(value.size()),
+        kIdeCodePage, 0, value.data(), static_cast<int>(value.size()),
         result.data(), required);
     return result;
 }
@@ -134,7 +131,7 @@ std::string WideToAnsi(std::wstring_view value)
         return {};
     }
     const int required = WideCharToMultiByte(
-        CP_ACP, WC_NO_BEST_FIT_CHARS, value.data(), static_cast<int>(value.size()),
+        kIdeCodePage, WC_NO_BEST_FIT_CHARS, value.data(), static_cast<int>(value.size()),
         nullptr, 0, nullptr, nullptr);
     if (required <= 0) {
         return {};
@@ -142,7 +139,7 @@ std::string WideToAnsi(std::wstring_view value)
     std::string result(static_cast<size_t>(required), '\0');
     BOOL usedDefault = FALSE;
     WideCharToMultiByte(
-        CP_ACP, WC_NO_BEST_FIT_CHARS, value.data(), static_cast<int>(value.size()),
+        kIdeCodePage, WC_NO_BEST_FIT_CHARS, value.data(), static_cast<int>(value.size()),
         result.data(), required, nullptr, &usedDefault);
     if (usedDefault != FALSE) {
         return {};
@@ -244,6 +241,66 @@ bool StartsWithInsensitive(std::wstring_view value, std::wstring_view prefix)
     return _wcsnicmp(value.data(), prefix.data(), prefix.size()) == 0;
 }
 
+bool ContainsInsensitive(std::wstring_view value, std::wstring_view needle)
+{
+    if (needle.empty()) {
+        return true;
+    }
+    if (value.size() < needle.size()) {
+        return false;
+    }
+    for (size_t index = 0; index + needle.size() <= value.size(); ++index) {
+        if (_wcsnicmp(value.data() + index, needle.data(), needle.size()) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsCommonInteractiveControl(const IdeEventRouter::UiEvent& event)
+{
+    return _stricmp(event.controlType.c_str(), "button") == 0 ||
+        _stricmp(event.controlType.c_str(), "select") == 0 ||
+        _stricmp(event.controlType.c_str(), "radio") == 0 ||
+        _stricmp(event.controlType.c_str(), "checkbox") == 0;
+}
+
+std::wstring DefaultHandlerSuffix(const IdeEventRouter::UiEvent& event)
+{
+    if (_stricmp(event.controlType.c_str(), "select") == 0) {
+        return L"_选择项被改变";
+    }
+    if (_stricmp(event.controlType.c_str(), "radio") == 0 ||
+        _stricmp(event.controlType.c_str(), "checkbox") == 0) {
+        return L"_选中状态被改变";
+    }
+    return L"_被单击";
+}
+
+bool IsWindowControlEvent(const IdeEventRouter::UiEvent& event)
+{
+    if (_stricmp(event.controlType.c_str(), "button") != 0) {
+        return false;
+    }
+    const std::wstring identity =
+        Utf8ToWide(event.elementId) + L" " + Utf8ToWide(event.handlerName) + L" " +
+        Utf8ToWide(event.callParam);
+    const bool hasWindowContext =
+        ContainsInsensitive(identity, L"window") ||
+        ContainsInsensitive(identity, L"modal") ||
+        ContainsInsensitive(identity, L"dialog") ||
+        ContainsInsensitive(identity, L"browser") ||
+        ContainsInsensitive(identity, L"qr");
+    const bool hasWindowAction =
+        ContainsInsensitive(identity, L"close") ||
+        ContainsInsensitive(identity, L"hide") ||
+        ContainsInsensitive(identity, L"dismiss") ||
+        ContainsInsensitive(identity, L"minimize") ||
+        ContainsInsensitive(identity, L"maximize");
+    const std::wstring channel = Utf8ToWide(event.callParam);
+    return StartsWithInsensitive(channel, L"win:") ||
+        (hasWindowContext && hasWindowAction);
+}
 // Derives the callback subroutine name for a channel subscription. Known
 // channels map to the established Chinese naming (ipc_窗口最小化); anything
 // else falls back to ipc_ + sanitized tail of the channel.
@@ -373,57 +430,101 @@ std::wstring GetWindowTitle(HWND window)
     return title;
 }
 
-bool TitleContainsName(std::wstring_view title, std::wstring_view name)
+HWND FindMdiDocument(HWND mdiClient, std::wstring_view pageName)
 {
-    if (name.empty() || title.size() < name.size()) {
-        return false;
+    return ProjectAssembly::FindOpenDocument(mdiClient, pageName);
+}
+
+ProjectAssembly::Lookup LookupAssemblyPage(
+    HWND mainWindow, HWND mdiClient, std::wstring_view name)
+{
+    auto found = ProjectAssembly::FindAndOpen(mainWindow, mdiClient, name);
+    DesignerLog::Write(
+        "UI_EVENT assembly_lookup name=\"" + WideToUtf8(name) +
+        "\" source=program_tree state=" +
+        (found.state == ProjectAssembly::State::Found ? "found" :
+         found.state == ProjectAssembly::State::Absent ? "absent" :
+         found.state == ProjectAssembly::State::Ambiguous ? "ambiguous" : "unavailable") +
+        " matches=" + std::to_string(found.matches) +
+        " nodes=" + std::to_string(found.nodes) +
+        " document=" + DesignerLog::HexPointer(found.document) +
+        " reason=" + found.reason);
+    return found;
+}
+
+std::string AssemblyLookupFailure(
+    const ProjectAssembly::Lookup& found, std::wstring_view name)
+{
+    if (found.state == ProjectAssembly::State::Ambiguous) {
+        return "程序集名称冲突：" + WideToUtf8(name) +
+            "，项目中有多份同名项目，已停止写入，请先检查程序工作夹";
     }
-    for (size_t index = 0; index + name.size() <= title.size(); ++index) {
-        if (_wcsnicmp(title.data() + index, name.data(), name.size()) == 0) {
-            return true;
+    if (found.state == ProjectAssembly::State::Found) {
+        return "程序集 " + WideToUtf8(name) +
+            " 已存在，但其代码页无法打开，已停止创建，请在程序工作夹中打开后重试";
+    }
+    return "无法完整读取程序工作夹，不能确认程序集 " + WideToUtf8(name) +
+        " 是否存在，已停止创建（" + found.reason + "）";
+}
+
+// The IDE holds one project at a time and carries its path in the main window
+// title, ahead of the "[程序集名]" suffix that changes with the active document.
+bool ExtractProjectPath(const std::wstring& title, std::wstring& projectPath)
+{
+    for (size_t index = 0; index + 3 < title.size(); ++index) {
+        const wchar_t drive = title[index];
+        const bool isDriveLetter =
+            (drive >= L'A' && drive <= L'Z') || (drive >= L'a' && drive <= L'z');
+        if (!isDriveLetter || title[index + 1] != L':' || title[index + 2] != L'\\') {
+            continue;
+        }
+        for (size_t end = index + 3; end + 1 < title.size(); ++end) {
+            if (title[end] == L'.' &&
+                (title[end + 1] == L'e' || title[end + 1] == L'E') &&
+                (end + 2 == title.size() || title[end + 2] == L' ' ||
+                 title[end + 2] == L'[')) {
+                projectPath = title.substr(index, end + 2 - index);
+                return true;
+            }
         }
     }
     return false;
 }
 
-HWND FindMdiDocument(HWND mdiClient, std::wstring_view pageName)
+// Every cache below describes one project's pages. Opening another project
+// closes all of them, so carrying the entries over would let this project be
+// judged by what the previous one contained: a remembered subscription would
+// suppress a write this project still needs, and a remembered assembly would
+// refuse to create one it does not have yet.
+void ResetSessionCachesIfProjectChanged(HWND mainWindow)
 {
-    for (auto iterator = g_knownAssemblyDocuments.begin();
-         iterator != g_knownAssemblyDocuments.end();) {
-        if (iterator->document == nullptr || !IsWindow(iterator->document) ||
-            GetParent(iterator->document) != mdiClient) {
-            iterator = g_knownAssemblyDocuments.erase(iterator);
-            continue;
-        }
-        if (_wcsicmp(iterator->name.c_str(), std::wstring(pageName).c_str()) == 0) {
-            return iterator->document;
-        }
-        ++iterator;
-    }
-    HWND child = GetWindow(mdiClient, GW_CHILD);
-    while (child != nullptr) {
-        if (GetParent(child) == mdiClient &&
-            (GetWindowLongPtrW(child, GWL_EXSTYLE) & WS_EX_MDICHILD) != 0 &&
-            TitleContainsName(GetWindowTitle(child), pageName)) {
-            return child;
-        }
-        child = GetWindow(child, GW_HWNDNEXT);
-    }
-    return nullptr;
-}
-
-void RememberAssemblyDocument(std::wstring_view name, HWND document)
-{
-    if (document == nullptr || !IsWindow(document)) {
+    if (mainWindow == nullptr || !IsWindow(mainWindow)) {
         return;
     }
-    for (KnownAssemblyDocument& known : g_knownAssemblyDocuments) {
-        if (_wcsicmp(known.name.c_str(), std::wstring(name).c_str()) == 0) {
-            known.document = document;
-            return;
-        }
+    wchar_t title[1024]{};
+    GetWindowTextW(mainWindow, title, 1024);
+    std::wstring projectPath;
+    // An unsaved new project has no path in the title. Keeping the caches is
+    // the safer half of that guess: they still describe pages that are open.
+    if (!ExtractProjectPath(title, projectPath)) {
+        return;
     }
-    g_knownAssemblyDocuments.push_back({std::wstring(name), document});
+    // Also covers the case where the preview window is closed: routing still
+    // runs, so the log still follows the project rather than going quiet.
+    DesignerLog::UseProjectFile(projectPath);
+    static std::wstring currentProject;
+    if (_wcsicmp(currentProject.c_str(), projectPath.c_str()) == 0) {
+        return;
+    }
+    const bool hadPreviousProject = !currentProject.empty();
+    currentProject = projectPath;
+    if (!hadPreviousProject) {
+        return;
+    }
+    g_fastJumpKeys.clear();
+    g_writtenSubscriptionKeys.clear();
+    DesignerLog::Write(
+        "UI_EVENT session_cache_reset project=\"" + WideToUtf8(projectPath) + "\"");
 }
 
 HWND FindAnyNativeMdiDocument(HWND mdiClient)
@@ -607,17 +708,14 @@ void DumpPageHead(int rows)
     DesignerLog::Write("UI_EVENT page_dump" + dump);
 }
 
-// Inserts ".子程序 <name>" at the bottom of the active page.
+// Creates a subroutine at the bottom of the active page.
 //
-// Path A: place the caret on the trailing empty row below the last data row
-// (verified through FN_GET_CARET_ROW_INDEX, because NES_RUN_FUNC returns TRUE
-// even when the move targeted a non-existent row) and insert the directive
-// text through FN_INSERT_TEXT - the editor parses it exactly like typing.
-//
-// Path B (fresh assembly pages have no trailing row): the IDE's own
-// FN_INSERT_NEW_SUB creates a sub template, whose name cell is then renamed
-// via FN_SET_AND_COMPILE_PRG_ITEM_TEXT - the same commit path the IDE's
-// name-cell editor uses.
+// FN_INSERT_NEW_SUB creates the valid IDE template, whose name cell is then
+// renamed via FN_SET_AND_COMPILE_PRG_ITEM_TEXT - the same commit path the
+// IDE's own name-cell editor uses. Do not mix this with textual
+// FN_INSERT_TEXT insertion: e5.95 updates the code-grid index lazily, so a
+// successful textual insert can look absent briefly and cause a duplicate
+// native subroutine if a fallback is attempted.
 bool QueryCaret(int& row, int& column)
 {
     row = -1;
@@ -669,89 +767,656 @@ bool RenameCellAt(int row, int column, const std::string& newNameAnsi)
     return setOk && verified;
 }
 
-bool CreateSubroutineAtPage(const std::string& subNameAnsi)
-{
-    const int subCountBefore = CountCellsOfType(VT_SUB_NAME);
-    const PageScanResult anyCell = ScanPageForType(VT_SUB_NAME, std::string(), true);
-    const int bottomRow = anyCell.lastRow;
-    DesignerLog::Write(
-        "UI_EVENT create_sub begin bottom_row=" + std::to_string(bottomRow) +
-        " subs_before=" + std::to_string(subCountBefore));
+// ---------- whole-page source text ----------
+std::string CompactStatement(std::string_view text);
 
-    // Path A: trailing empty row + direct directive insert.
-    if (bottomRow >= 0) {
-        InvokeIde(FN_MOVE_CARET, static_cast<DWORD>(bottomRow + 1), 0);
-        int caretRow = -1;
-        int caretColumn = -1;
-        if (QueryCaret(caretRow, caretColumn) && caretRow == bottomRow + 1) {
-            const std::string insertText = ".子程序 " + subNameAnsi + "\r\n";
-            InvokeIde(
-                FN_INSERT_TEXT,
-                PointerToDword(const_cast<char*>(insertText.c_str())),
-                FALSE);
-            PumpMessagesFor(kInsertSettleMs);
-            if (ScanPageForType(VT_SUB_NAME, subNameAnsi, false).matchRow >= 0) {
-                DesignerLog::Write("UI_EVENT create_sub path=insert_text ok=1");
-                return true;
-            }
-            DesignerLog::Write("UI_EVENT create_sub path=insert_text ok=0");
+bool ReadPageCodeUtf8(std::string& pageText)
+{
+    pageText.clear();
+    std::string error;
+    if (HookBridge::ReadPageCode(pageText, error) && !pageText.empty()) {
+        DesignerLog::Write("HYBRID memory_page_read transport=memory_model bytes=" +
+            std::to_string(pageText.size()));
+        return true;
+    }
+    pageText.clear();
+    DesignerLog::Write("HYBRID memory_page_read failed error=\"" + error +
+        "\" action=stop_without_fallback");
+    return false;
+}
+
+
+int CountSubInPage(const PageCodeInfo& info, const std::string& subUtf8)
+{
+    int count = 0;
+    for (const std::string& name : info.subNamesUtf8) {
+        if (_stricmp(name.c_str(), subUtf8.c_str()) == 0) {
+            ++count;
         }
-        else {
-            DesignerLog::Write(
-                "UI_EVENT create_sub no_trailing_row caret=" +
-                std::to_string(caretRow) + "/" + std::to_string(caretColumn));
+    }
+    return count;
+}
+
+// The line the subroutine's header sits on, or -1. Only the first match is
+// reported: a page with two copies of a name is a state the caller has to see
+// as such, not one to silently pick a side in.
+int SubLineFromPageText(const PageCodeInfo& info, const std::string& subUtf8)
+{
+    for (size_t index = 0; index < info.subNamesUtf8.size(); ++index) {
+        if (_stricmp(info.subNamesUtf8[index].c_str(), subUtf8.c_str()) != 0) {
+            continue;
+        }
+        return index < info.subLinesFromText.size()
+            ? info.subLinesFromText[index]
+            : -1;
+    }
+    return -1;
+}
+
+// Use the IDE's program-item identity before consulting approximate text rows.
+// A write still requires a matching name cell at the resulting physical row.
+int ResolveRowFromProgramTree(const std::string& subNameAnsi)
+{
+    const HWND mainWindow = reinterpret_cast<HWND>(NotifySys(NES_GET_MAIN_HWND, 0, 0));
+    const HWND mdiClient = FindWindowExW(mainWindow, nullptr, L"MDIClient", nullptr);
+    const HWND document = reinterpret_cast<HWND>(SendMessageW(mdiClient, WM_MDIGETACTIVE, 0, 0));
+    wchar_t title[2048]{};
+    const int copied = GetWindowTextW(document, title, 2048);
+    constexpr std::wstring_view prefix = L"程序集: ";
+    const std::wstring_view titleView(title);
+    if (copied <= 0 || copied >= 2047 || !titleView.starts_with(prefix)) return -1;
+    if (!ProjectAssembly::JumpToSubroutine(mainWindow, mdiClient,
+            titleView.substr(prefix.size()), AnsiToWide(subNameAnsi))) return -1;
+    int row = -1;
+    int column = -1;
+    QueryCaret(row, column);
+    // Native Jump can place the caret in the first parameter instead of the
+    // name cell. Probe that small neighbourhood without moving it again.
+    const int first = row > 4 ? row - 4 : 0;
+    for (int probe = first; row >= 0 && probe <= row + 1; ++probe) {
+        for (int col = 0; col < kMaximumColumnsToScan; ++col) {
+            CellText cell;
+            if (ReadCell(probe, col, cell) && cell.type == VT_SUB_NAME &&
+                _stricmp(cell.text.c_str(), subNameAnsi.c_str()) == 0) {
+                DesignerLog::Write("UI_EVENT sub_row source=program_tree sub=\"" +
+                    WideToUtf8(AnsiToWide(subNameAnsi)) + "\" row=" +
+                    std::to_string(probe) + " caret=" + std::to_string(row));
+                return probe;
+            }
+        }
+    }
+    DesignerLog::Write("UI_EVENT sub_row source=program_tree sub=\"" +
+        WideToUtf8(AnsiToWide(subNameAnsi)) + "\" row=-1 caret=" + std::to_string(row));
+    return -1;
+}
+
+// How far either side of the text hint the grid is probed. The two coordinate
+// spaces are close but not identical: a six-callback page put a header on text
+// line 48 that the grid held at row 46, so the text line is an aim point rather
+// than an address. The near reach covers that gap plus the subscription
+// statement each click appends above the target. The far reach is for the second
+// pass, which has a fully materialised page to scan and no reason to assume the
+// gap stays this small once more subroutines sit above the target.
+constexpr int kTextHintReach = 16;
+constexpr int kTextHintFarReach = 64;
+
+// Turns a page-text line index into a physical grid row.
+//
+// The grid answers only for rows it has materialised, which is roughly the
+// window around the caret: a subroutine far from wherever the caret was last
+// left reads back as absent no matter how long you wait. That is why locating
+// one used to mean dragging a 24-row window across the entire document and
+// bouncing the caret off both ends - seconds of visible caret movement on a
+// page whose text had already been read correctly. The caret does reach any
+// row directly, so one move to the line the text reported is enough to
+// materialise the target's neighbourhood, after which the exact row can be
+// read out of the grid. Returns -1 when the name is not there, which leaves
+// the caller's slower path intact rather than jumping somewhere approximate.
+int ResolveRowNearTextLine(const std::string& subNameAnsi, int textLine)
+{
+    const int nativeRow = ResolveRowFromProgramTree(subNameAnsi);
+    if (nativeRow >= 0) return nativeRow;
+    if (textLine < 0) {
+        return -1;
+    }
+    int landedRow = -1;
+    int landedColumn = -1;
+    int bottomRow = -1;
+    // Two passes, because FN_MOVE_CARET turned out not to be the universal way
+    // to materialise a row that it was taken for. It is clamped to the rows the
+    // grid already holds, so aiming it past that extent - precisely the case
+    // this probe exists for - leaves the caret short of the target and the whole
+    // band reading empty. FN_MOVE_BOTTOM is not clamped: it goes to the
+    // document's real end and renders the tail on the way. That single call is
+    // the only thing the windowed walk did that this did not, and it is why the
+    // walk kept locating rows the probe had just reported absent.
+    for (int pass = 1; pass <= 2; ++pass) {
+        int aimRow = textLine;
+        if (pass == 2) {
+            InvokeIde(FN_MOVE_BOTTOM, 0, 0);
+            PumpMessagesFor(60);
+            int bottomColumn = -1;
+            QueryCaret(bottomRow, bottomColumn);
+            if (bottomRow >= 0 && aimRow > bottomRow) {
+                aimRow = bottomRow;
+            }
+        }
+        InvokeIde(FN_MOVE_CARET, static_cast<DWORD>(aimRow), 0);
+        PumpMessagesFor(pass == 1 ? 40 : 80);
+        QueryCaret(landedRow, landedColumn);
+        const int reach = pass == 1 ? kTextHintReach : kTextHintFarReach;
+        // Text and grid rows can drift by over 100 lines on a large page.
+        // At the tail use the actual clamped aim, not a band beyond EOF.
+        const int first = aimRow > reach ? aimRow - reach : 0;
+        int last = aimRow + reach;
+        if (bottomRow >= 0 && last > bottomRow) {
+            last = bottomRow;
+        }
+        for (int row = first; row <= last && row < kMaximumRowsToScan; ++row) {
+            for (int column = 0; column < kMaximumColumnsToScan; ++column) {
+                CellText cell;
+                if (!ReadCell(row, column, cell) || !CellHasData(cell)) {
+                    continue;
+                }
+                if (cell.type != VT_SUB_NAME || cell.text.empty()) {
+                    continue;
+                }
+                if (_stricmp(cell.text.c_str(), subNameAnsi.c_str()) == 0) {
+                    DesignerLog::Write(
+                        "HYBRID text_row_hint sub=\"" +
+                        WideToUtf8(AnsiToWide(subNameAnsi)) +
+                        "\" text_line=" + std::to_string(textLine) +
+                        " grid_row=" + std::to_string(row) +
+                        " delta=" + std::to_string(row - textLine) +
+                        " pass=" + std::to_string(pass) +
+                        " caret_landed=" + std::to_string(landedRow));
+                    return row;
+                }
+            }
+        }
+    }
+    // caret_landed short of text_line says the clamp above was in play;
+    // caret_landed equal to it says the name is further from its text line than
+    // the far reach, which would mean the two coordinate spaces have drifted
+    // much further apart than any page has shown so far.
+    DesignerLog::Write(
+        "HYBRID text_row_hint sub=\"" + WideToUtf8(AnsiToWide(subNameAnsi)) +
+        "\" text_line=" + std::to_string(textLine) + " grid_row=-1" +
+        " caret_landed=" + std::to_string(landedRow) +
+        " bottom_row=" + std::to_string(bottomRow));
+    return -1;
+}
+
+// Convenience for the callers that hold page text rather than a parsed page:
+// resolves a row only when the text proves the name appears exactly once.
+int ResolveRowFromPageText(
+    const std::string& pageTextUtf8,
+    const std::string& subNameAnsi,
+    const std::string& subNameUtf8)
+{
+    if (pageTextUtf8.empty()) {
+        return -1;
+    }
+    const PageCodeInfo page = ParsePageCode(pageTextUtf8);
+    if (!page.valid || CountSubInPage(page, subNameUtf8) != 1) {
+        return -1;
+    }
+    return ResolveRowNearTextLine(
+        subNameAnsi, SubLineFromPageText(page, subNameUtf8));
+}
+
+// Collects the statement lines belonging to subUtf8 - from its .子程序 header
+// up to the next one - with whitespace stripped, so tokens match the same way
+// CompactStatement makes them match against grid text. The page text is the
+// only view of the page that does not stop at the fold, which makes it the only
+// source that can answer "is this body line missing" for a subroutine sitting
+// below it.
+bool SubBlockCompactFromPageText(
+    const std::string& pageTextUtf8,
+    const std::string& subUtf8,
+    std::string& blockCompactUtf8)
+{
+    blockCompactUtf8.clear();
+    const std::string subTag = WideToUtf8(L".子程序");
+    bool inBlock = false;
+    bool found = false;
+    size_t lineStart = 0;
+    while (lineStart < pageTextUtf8.size()) {
+        size_t lineEnd = pageTextUtf8.find('\n', lineStart);
+        if (lineEnd == std::string::npos) {
+            lineEnd = pageTextUtf8.size();
+        }
+        std::string_view line(pageTextUtf8.data() + lineStart, lineEnd - lineStart);
+        lineStart = lineEnd + 1;
+        std::string_view trimmed = line;
+        const size_t indent = trimmed.find_first_not_of(" \t");
+        if (indent != std::string_view::npos) {
+            trimmed.remove_prefix(indent);
+        }
+        if (trimmed.rfind(subTag, 0) == 0) {
+            const std::string name = LeadingIdentifier(trimmed.substr(subTag.size()));
+            inBlock = _stricmp(name.c_str(), subUtf8.c_str()) == 0;
+            found = found || inBlock;
+            continue;
+        }
+        if (inBlock) {
+            blockCompactUtf8 += CompactStatement(line);
+            blockCompactUtf8.push_back('\n');
+        }
+    }
+    return found;
+}
+
+// e5.95 materialises its subroutine index lazily, so a block appended through
+// the hook's native paste can stay invisible to FN_GET_PRG_TEXT until
+// something walks the page. A single scan that misses it reads as "absent",
+// and creating on that answer appends another copy at the bottom - the very
+// region the next scan cannot see either, so duplicates compound silently.
+// Hence a three-state answer: absence only counts when the page proved it can
+// still read back other subroutine names.
+enum class SubLookupState {
+    Found,
+    // The page text proves the block exists but no physical row could be
+    // resolved for it. Callers must treat this as "exists" - creating again
+    // would append a duplicate - while skipping anything that needs a row.
+    FoundTextOnly,
+    ConfirmedAbsent,
+    Unreadable,
+};
+
+struct SubLookupResult {
+    SubLookupState state = SubLookupState::Unreadable;
+    int row = -1;
+    int duplicateRows = 0;
+    // The page source this answer was derived from. Handed back so the rest of
+    // the event can answer its own "does this line exist" questions from it
+    // instead of select-alling the page again per question.
+    std::string pageTextUtf8;
+};
+
+// Unlike ScanPageForType, which returns on the first exact match by design,
+// this walks the whole page so same-named blocks can be counted. Thorough mode
+// widens the "consecutive empty rows means end of page" heuristic: that bound
+// is only a guess about how densely the grid indexes rows, and guessing low
+// reports a subroutine as absent when it merely sits past the gap.
+void CollectSubroutineRows(
+    const std::string& subNameAnsi,
+    std::vector<int>& matchingRows,
+    int& nonEmptyNameCells,
+    int& lastRowSeen,
+    bool thorough = false)
+{
+    matchingRows.clear();
+    nonEmptyNameCells = 0;
+    lastRowSeen = -1;
+    const int missingRowLimit =
+        thorough ? kThoroughMissingRowsToStop : kMaximumMissingRowsToStop;
+    int consecutiveMissingRows = 0;
+    for (int row = 0; row < kMaximumRowsToScan; ++row) {
+        bool rowExists = false;
+        for (int column = 0; column < kMaximumColumnsToScan; ++column) {
+            CellText cell;
+            if (!ReadCell(row, column, cell) || !CellHasData(cell)) {
+                continue;
+            }
+            rowExists = true;
+            lastRowSeen = row;
+            if (cell.type != VT_SUB_NAME || cell.text.empty()) {
+                continue;
+            }
+            ++nonEmptyNameCells;
+            if (_stricmp(cell.text.c_str(), subNameAnsi.c_str()) == 0) {
+                matchingRows.push_back(row);
+            }
+        }
+        consecutiveMissingRows = rowExists ? 0 : consecutiveMissingRows + 1;
+        if (consecutiveMissingRows >= missingRowLimit) {
+            break;
+        }
+    }
+}
+
+// FN_GET_PRG_TEXT only answers for rows the grid has materialised, which is
+// roughly the visible window: on a page taller than the editor every row past
+// the fold reads back empty no matter how long you wait, which is why a plain
+// top-down scan finds two subroutines on a five-subroutine page. The caret does
+// reach those rows though, so take the document's real height from
+// FN_MOVE_BOTTOM and drag the readable window down over it in overlapping
+// steps. Rows that read empty stay eligible for a later window - marking them
+// visited is what would re-create the original blindness.
+void CollectSubroutineRowsWindowed(
+    const std::string& subNameAnsi,
+    std::vector<int>& matchingRows,
+    int& nonEmptyNameCells,
+    int& lastRowSeen,
+    int& documentLastRow)
+{
+    matchingRows.clear();
+    nonEmptyNameCells = 0;
+    lastRowSeen = -1;
+    documentLastRow = -1;
+    int savedRow = -1;
+    int savedColumn = -1;
+    QueryCaret(savedRow, savedColumn);
+    InvokeIde(FN_MOVE_BOTTOM, 0, 0);
+    int bottomRow = -1;
+    int bottomColumn = -1;
+    QueryCaret(bottomRow, bottomColumn);
+    documentLastRow = bottomRow;
+    if (bottomRow < 0) {
+        return;
+    }
+    if (bottomRow >= kMaximumRowsToScan) {
+        bottomRow = kMaximumRowsToScan - 1;
+    }
+    constexpr int kWindowStep = 24;
+    constexpr int kWindowReach = 48;
+    std::vector<char> hasData(static_cast<size_t>(bottomRow) + 1, 0);
+    for (int base = 0; base <= bottomRow; base += kWindowStep) {
+        InvokeIde(FN_MOVE_CARET, static_cast<DWORD>(base), 0);
+        PumpMessagesFor(20);
+        const int first = base > kWindowReach ? base - kWindowReach : 0;
+        const int last = base + kWindowReach < bottomRow ? base + kWindowReach : bottomRow;
+        for (int row = first; row <= last; ++row) {
+            if (hasData[static_cast<size_t>(row)] != 0) {
+                continue;
+            }
+            for (int column = 0; column < kMaximumColumnsToScan; ++column) {
+                CellText cell;
+                if (!ReadCell(row, column, cell) || !CellHasData(cell)) {
+                    continue;
+                }
+                hasData[static_cast<size_t>(row)] = 1;
+                if (row > lastRowSeen) {
+                    lastRowSeen = row;
+                }
+                if (cell.type != VT_SUB_NAME || cell.text.empty()) {
+                    continue;
+                }
+                ++nonEmptyNameCells;
+                if (_stricmp(cell.text.c_str(), subNameAnsi.c_str()) == 0) {
+                    matchingRows.push_back(row);
+                }
+            }
+        }
+    }
+    std::sort(matchingRows.begin(), matchingRows.end());
+    if (savedRow >= 0 && savedColumn >= 0) {
+        InvokeIde(
+            FN_MOVE_CARET, static_cast<DWORD>(savedRow), static_cast<DWORD>(savedColumn));
+    }
+}
+
+// What the page itself says after a memory-bridge paste.
+//
+// The grid used to be asked first, and it answers for materialised rows only:
+// a landed write read back as absent, which reported a completed insertion as a
+// failure and abandoned the rest of the event - no parameters, no body, no
+// subscription line. Worse, the escalation that followed drove the caret to both
+// ends of the page up to three times per click, which is the caret movement
+// visible during a write. The page source settles presence in one round trip,
+// and the grid is consulted only for the row number a jump needs.
+struct MemoryWriteCheck {
+    // The page's own source text carries the block.
+    bool present = false;
+    // The page could be rendered at all; when false, absence is unproven.
+    bool pageReadable = false;
+    int row = -1;
+    std::string pageTextUtf8;
+};
+
+MemoryWriteCheck ConfirmMemoryWrite(
+    const std::string& subNameAnsi,
+    const std::string& knownPageTextUtf8 = std::string())
+{
+    MemoryWriteCheck out;
+    const std::string subUtf8 = WideToUtf8(AnsiToWide(subNameAnsi));
+    int copies = 0;
+    int textLine = -1;
+    out.pageTextUtf8 = knownPageTextUtf8;
+    if (!out.pageTextUtf8.empty() || ReadPageCodeUtf8(out.pageTextUtf8)) {
+        const PageCodeInfo page = ParsePageCode(out.pageTextUtf8);
+        if (page.valid) {
+            out.pageReadable = true;
+            copies = CountSubInPage(page, subUtf8);
+            out.present = copies > 0;
+            textLine = SubLineFromPageText(page, subUtf8);
+        }
+    }
+    if (!out.pageReadable) {
+        DesignerLog::Write("HYBRID memory_verify source=unreadable action=stop_without_fallback");
+        return out;
+    }
+    // Cell reads below resolve navigation only after memory source proves presence.
+    out.row = ScanPageForType(VT_SUB_NAME, subNameAnsi, false).matchRow;
+    // A block just pasted below the fold is routinely absent from the grid, and
+    // reporting row=-1 for it left the caret to be placed by a full page walk at
+    // the end of the event. The text already said which line it is on.
+    if (out.row < 0 && copies == 1) {
+        out.row = ResolveRowNearTextLine(subNameAnsi, textLine);
+    }
+    DesignerLog::Write(
+        "HYBRID memory_verify source=page_text present=" +
+        std::to_string(out.present ? 1 : 0) + " row=" + std::to_string(out.row) +
+        " page_bytes=" + std::to_string(out.pageTextUtf8.size()) +
+        " sub=\"" + WideToUtf8(AnsiToWide(subNameAnsi)) + "\"");
+    return out;
+}
+
+// knownPageTextUtf8 lets a caller that already rendered this page hand the
+// text down: two lookups in one event otherwise render the same page twice for
+// answers that cannot have changed in between.
+SubLookupResult LookupSubroutine(
+    HWND mdiClient,
+    HWND document,
+    const std::string& subNameAnsi,
+    const std::string& knownPageTextUtf8 = std::string())
+{
+    SubLookupResult out;
+    const std::string subUtf8 = WideToUtf8(AnsiToWide(subNameAnsi));
+
+    // Primary oracle: the page's own source text. It answers "does this exist,
+    // and how many times" exactly, which a grid walk can only approximate.
+    std::string pageText = knownPageTextUtf8;
+    PageCodeInfo page;
+    if (!pageText.empty() || ReadPageCodeUtf8(pageText)) {
+        page = ParsePageCode(pageText);
+        out.pageTextUtf8 = pageText;
+    }
+    const int textCopies = page.valid ? CountSubInPage(page, subUtf8) : -1;
+
+    // The grid walk stays, because every writer downstream needs a physical
+    // row number and the page text carries none. It is skipped outright when
+    // the page parsed cleanly and never mentions the name: that settles the
+    // question on its own, and the walk would spend a few hundred cell reads
+    // per click only to agree.
+    std::vector<int> rows;
+    int nameCells = 0;
+    int lastRow = -1;
+    int attempts = 0;
+    int documentLastRow = -1;
+    if (textCopies > 0) {
+        CollectSubroutineRows(subNameAnsi, rows, nameCells, lastRow);
+        if (rows.empty() && textCopies == 1) {
+            // The text has both the proof and the position, so the row costs one
+            // caret move towards the target. This is the common case for any
+            // subroutine sitting away from wherever the caret was last left, and
+            // sending the window walk after it is what made a click on an
+            // already-written handler take seconds of visible caret travel.
+            const int resolved = ResolveRowNearTextLine(
+                subNameAnsi, SubLineFromPageText(page, subUtf8));
+            if (resolved >= 0) {
+                rows.push_back(resolved);
+            }
+        }
+        // Navigation only: source presence was already proven by memory. A read
+        // failure never reaches this branch and never becomes permission to write.
+        const bool rowStillOwed = textCopies > 0;
+        // The resolved single copy is the case worth being frugal about; the
+        // others are already rare or already broken.
+        const int maximumAttempts = textCopies == 1 ? 1 : 2;
+        for (int attempt = 1;
+             rows.empty() && rowStillOwed && attempt <= maximumAttempts;
+             ++attempt) {
+            if (attempt == 2 && document != nullptr && IsWindow(document)) {
+                ActivateDocument(mdiClient, document);
+                PumpMessagesFor(150);
+            }
+            CollectSubroutineRowsWindowed(
+                subNameAnsi, rows, nameCells, lastRow, documentLastRow);
+            attempts = attempt;
         }
     }
 
-    // Path B: IDE-native "insert new sub" + rename of its name cell.
-    InvokeIde(FN_MOVE_BOTTOM, 0, 0);
-    PumpMessagesFor(80);
-    InvokeIde(FN_INSERT_NEW_SUB, 0, 0);
-    PumpMessagesFor(kInsertSettleMs);
-    const int subCountAfter = CountCellsOfType(VT_SUB_NAME);
+    const int gridCopies = static_cast<int>(rows.size());
+    if (!rows.empty()) {
+        out.state = SubLookupState::Found;
+        out.row = rows.front();
+        out.duplicateRows = textCopies > gridCopies ? textCopies : gridCopies;
+    }
+    else if (textCopies > 0) {
+        // The text proves the block exists even though no row could be
+        // resolved. This is "exists", not "unknown": treating it as unknown is
+        // what made a completed write report failure.
+        out.state = SubLookupState::FoundTextOnly;
+        out.duplicateRows = textCopies;
+    }
+    else if (textCopies == 0) {
+        out.state = SubLookupState::ConfirmedAbsent;
+    }
+    else {
+        out.state = SubLookupState::Unreadable;
+    }
     DesignerLog::Write(
-        "UI_EVENT create_sub new_sub_cmd subs " +
-        std::to_string(subCountBefore) + "->" + std::to_string(subCountAfter));
+        "UI_EVENT sub_lookup name=\"" + subUtf8 +
+        "\" state=" + std::string(
+            out.state == SubLookupState::Found
+                ? "found"
+                : out.state == SubLookupState::FoundTextOnly
+                    ? "found_text_only"
+                    : out.state == SubLookupState::ConfirmedAbsent ? "absent" : "unreadable") +
+        " row=" + std::to_string(out.row) +
+        " copies=" + std::to_string(out.duplicateRows) +
+        " text_copies=" + std::to_string(textCopies) +
+        " text_subs=" + std::to_string(page.subNamesUtf8.size()) +
+        " page_asm=\"" + page.assemblyUtf8 + "\"" +
+        " attempts=" + std::to_string(attempts) +
+        " name_cells=" + std::to_string(nameCells) +
+        " last_row=" + std::to_string(lastRow) +
+        " doc_rows=" + std::to_string(documentLastRow));
+    if (out.duplicateRows > 1) {
+        std::string rowList;
+        for (const int row : rows) {
+            if (!rowList.empty()) {
+                rowList += ",";
+            }
+            rowList += std::to_string(row);
+        }
+        DesignerLog::Write(
+            "UI_EVENT sub_duplicates name=\"" + subUtf8 +
+            "\" count=" + std::to_string(out.duplicateRows) + " rows=" + rowList +
+            " 警告：同名子程序存在多份，请手动删除多余的");
+    }
+    if (out.state == SubLookupState::Unreadable) {
+        DumpPageHead(48);
+    }
+    return out;
+}
+
+bool CreateSubroutineAtPage(const std::string& subNameAnsi)
+{
+    // Use only the IDE-native command for creating a subroutine. The former
+    // implementation first inserted a textual ".???" line and, when the
+    // lazy code-grid index did not expose it immediately, fell through to this
+    // command. In e5.95 that textual line could be accepted successfully and
+    // become visible a few seconds later, so the fallback created a duplicate
+    // subroutine (and could leave the editor in a bad state). The native
+    // command already creates a valid subroutine row; rename that row after the
+    // IDE has finished rebuilding its index.
+    const int subCountBefore = CountCellsOfType(VT_SUB_NAME);
+    DesignerLog::Write(
+        "UI_EVENT create_sub begin native_only subs_before=" +
+        std::to_string(subCountBefore));
+
+    const bool commandInvoked = InvokeIde(FN_INSERT_NEW_SUB, 0, 0) != FALSE;
+    DesignerLog::Write(
+        "UI_EVENT create_sub native_command invoke=" +
+        std::to_string(commandInvoked ? 1 : 0));
+    if (!commandInvoked) {
+        DumpPageHead(8);
+        return false;
+    }
+
+    int subCountAfter = subCountBefore;
+    for (int verifyAttempt = 0;
+         verifyAttempt < 20 && subCountAfter <= subCountBefore;
+         ++verifyAttempt) {
+        PumpMessagesFor(250);
+        subCountAfter = CountCellsOfType(VT_SUB_NAME);
+    }
+    DesignerLog::Write(
+        "UI_EVENT create_sub native_only subs " +
+        std::to_string(subCountBefore) + "->" +
+        std::to_string(subCountAfter));
     if (subCountAfter <= subCountBefore) {
         DumpPageHead(8);
         return false;
     }
-    DumpPageHead(10);
 
-    // The new sub appends at the bottom: rename the last VT_SUB_NAME cell.
+    // The native command appends the new subroutine at the bottom. Locate the
+    // last real VT_SUB_NAME cell without moving/selecting the page again.
     PageScanResult lastSub;
-    {
-        int consecutiveMissingRows = 0;
-        for (int currentRow = 0; currentRow < kMaximumRowsToScan; ++currentRow) {
-            bool rowExists = false;
-            for (int currentColumn = 0; currentColumn < kMaximumColumnsToScan; ++currentColumn) {
-                CellText cell;
-                if (!ReadCell(currentRow, currentColumn, cell) || !CellHasData(cell)) {
-                    continue;
-                }
-                rowExists = true;
-                if (cell.type == VT_SUB_NAME) {
-                    lastSub.matchRow = currentRow;
-                    lastSub.matchColumn = currentColumn;
-                    lastSub.matchText = cell.text;
-                }
+    int consecutiveMissingRows = 0;
+    for (int currentRow = 0; currentRow < kMaximumRowsToScan; ++currentRow) {
+        bool rowExists = false;
+        for (int currentColumn = 0;
+             currentColumn < kMaximumColumnsToScan;
+             ++currentColumn) {
+            CellText cell;
+            if (!ReadCell(currentRow, currentColumn, cell) || !CellHasData(cell)) {
+                continue;
             }
-            consecutiveMissingRows = rowExists ? 0 : consecutiveMissingRows + 1;
-            if (consecutiveMissingRows >= kMaximumMissingRowsToStop) {
-                break;
+            rowExists = true;
+            if (cell.type == VT_SUB_NAME) {
+                lastSub.matchRow = currentRow;
+                lastSub.matchColumn = currentColumn;
+                lastSub.matchText = cell.text;
             }
+        }
+        consecutiveMissingRows = rowExists ? 0 : consecutiveMissingRows + 1;
+        if (consecutiveMissingRows >= kMaximumMissingRowsToStop) {
+            break;
         }
     }
     if (lastSub.matchRow < 0) {
-        DesignerLog::Write("UI_EVENT create_sub new_sub_cell=none");
+        DesignerLog::Write("UI_EVENT create_sub native_only new_sub_cell=none");
         return false;
     }
     DesignerLog::Write(
-        "UI_EVENT create_sub new_sub_cell=\"" +
+        "UI_EVENT create_sub native_only new_sub_cell=\"" +
         WideToUtf8(AnsiToWide(lastSub.matchText)) + "\" row=" +
         std::to_string(lastSub.matchRow) + " col=" +
         std::to_string(lastSub.matchColumn));
-    return RenameCellAt(lastSub.matchRow, lastSub.matchColumn, subNameAnsi);
+
+    const bool renamed = RenameCellAt(lastSub.matchRow, lastSub.matchColumn, subNameAnsi);
+    if (!renamed) {
+        return false;
+    }
+    for (int verifyAttempt = 0; verifyAttempt < 8; ++verifyAttempt) {
+        CellText renamedCell;
+        if (ReadCell(lastSub.matchRow, lastSub.matchColumn, renamedCell) &&
+            _stricmp(renamedCell.text.c_str(), subNameAnsi.c_str()) == 0) {
+            DesignerLog::Write(
+                "UI_EVENT create_sub native_only rename_verified row=" +
+                std::to_string(lastSub.matchRow));
+            return true;
+        }
+        PumpMessagesFor(100);
+    }
+    DesignerLog::Write(
+        "UI_EVENT create_sub native_only rename_unverified row=" +
+        std::to_string(lastSub.matchRow));
+    return renamed;
 }
 
 // Renames the assembly of the active page: moves the caret onto the
@@ -777,7 +1442,7 @@ bool RenameAssemblyViaApi(HWND targetDocument, const std::string& newNameAnsi)
         RenameCellAt(nameCell.matchRow, nameCell.matchColumn, newNameAnsi);
     PumpMessagesFor(150);
     const std::wstring title = GetWindowTitle(targetDocument);
-    const bool titleMatched = TitleContainsName(title, AnsiToWide(newNameAnsi));
+    const bool titleMatched = ProjectAssembly::MatchesDocumentTitle(title, AnsiToWide(newNameAnsi));
     DesignerLog::Write(
         "UI_EVENT rename_api cell_renamed=" + std::to_string(cellRenamed ? 1 : 0) +
         " title_verified=" + std::to_string(titleMatched ? 1 : 0) +
@@ -818,10 +1483,48 @@ bool IsSubscriptionStatement(
     return handlerAnsi.empty() || compact.find(handlerAnsi) != std::string::npos;
 }
 
+// Whether the fixed subscription routine already carries this channel's line,
+// judged from the page source. The grid path below has to scroll the page to the
+// top to read those rows, which on an already-wired button is pure cost the user
+// sees as the caret hunting around before it lands. Note the IDE serialises
+// string literals with full-width quotes, so the channel and &handler are
+// matched on their own rather than through a quoted token.
+bool PageTextHasSubscription(
+    const std::string& pageTextUtf8,
+    const std::string& subscribeSubUtf8,
+    const std::string& channelUtf8,
+    const std::string& handlerUtf8);
+
 struct StatementArea {
     std::vector<std::pair<int, std::string>> lines; // (row, compact text)
     int lastRow = -1;
 };
+
+bool PageTextHasSubscription(
+    const std::string& pageTextUtf8,
+    const std::string& subscribeSubUtf8,
+    const std::string& channelUtf8,
+    const std::string& handlerUtf8)
+{
+    std::string block;
+    if (pageTextUtf8.empty() ||
+        !SubBlockCompactFromPageText(pageTextUtf8, subscribeSubUtf8, block)) {
+        return false;
+    }
+    size_t lineStart = 0;
+    while (lineStart < block.size()) {
+        size_t lineEnd = block.find('\n', lineStart);
+        if (lineEnd == std::string::npos) {
+            lineEnd = block.size();
+        }
+        const std::string_view line(block.data() + lineStart, lineEnd - lineStart);
+        lineStart = lineEnd + 1;
+        if (IsSubscriptionStatement(line, channelUtf8, handlerUtf8)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // Collects the statement lines that belong to the subroutine whose name cell
 // sits at subNameRow: every following row up to the next "title" row (the
@@ -1055,10 +1758,11 @@ bool AppendStatementsIfMissing(
         return false;
     }
     InvokeIde(FN_MOVE_EDIT_CARET_TO_END, 0, 0);
-    const char* text = statementText.c_str();
-    // e5.95's own '.' keyboard handler passes TRUE here. This selects the
-    // editor parser path instead of inserting an opaque raw statement cell.
-    InvokeIde(FN_INSERT_TEXT, PointerToDword(const_cast<char*>(text)), TRUE);
+    std::string writeError;
+    if (!HookBridge::InsertAnsi(statementText, writeError)) {
+        DesignerLog::Write("UI_EVENT append_statement memory_write_failed error=\"" + writeError + "\"");
+        return false;
+    }
     PumpMessagesFor(kInsertSettleMs);
     // e5.95 can lag when rebuilding the statement grid: the write has landed
     // even though the immediate cell read still returns the old row. Do not
@@ -1110,7 +1814,8 @@ PageEnsureResult EnsureAssemblySubPage(
     HWND mainWindow,
     HWND mdiClient,
     const std::wstring& assembly,
-    const std::wstring& subName);
+    const std::wstring& subName,
+    const std::string& initialSource = std::string());
 void EnsureLifecycleCallbackBody(
     HWND mainWindow,
     HWND mdiClient,
@@ -1213,130 +1918,6 @@ struct SubParamSpec {
     const wchar_t* type;
 };
 
-// ---------- clipboard page helpers (only used for .参数 row insertion) ----------
-// Whole-page clipboard paste is ignored by e5.95 for the .程序集 name, which
-// is why assembly renames never use it - but .参数/.子程序 lines DO come
-// through, making it the reliable fallback for adding parameter rows.
-
-bool SetClipboardPageCodeWide(std::wstring_view wideText)
-{
-    if (wideText.empty()) {
-        DesignerLog::Write("UI_EVENT clipboard wide_empty");
-        return false;
-    }
-    // Strict ANSI first (WC_NO_BEST_FIT); fall back to best-fit conversion and
-    // finally to wide-only clipboard content - the IDE paste reads CF_UNICODETEXT.
-    std::string ansiText = WideToAnsi(wideText);
-    if (ansiText.empty()) {
-        const int required = WideCharToMultiByte(
-            CP_ACP, 0, wideText.data(), static_cast<int>(wideText.size()),
-            nullptr, 0, nullptr, nullptr);
-        if (required > 0) {
-            ansiText.assign(static_cast<size_t>(required), '\0');
-            WideCharToMultiByte(
-                CP_ACP, 0, wideText.data(), static_cast<int>(wideText.size()),
-                ansiText.data(), required, nullptr, nullptr);
-            while (!ansiText.empty() && ansiText.back() == '\0') {
-                ansiText.pop_back();
-            }
-        }
-        DesignerLog::Write(
-            "UI_EVENT clipboard ansi_relaxed bytes=" + std::to_string(ansiText.size()));
-    }
-
-    for (int attempt = 1; attempt <= 5; ++attempt) {
-        if (!OpenClipboard(nullptr)) {
-            DesignerLog::Write(
-                "UI_EVENT clipboard open_failed err=" +
-                std::to_string(GetLastError()) + " attempt=" + std::to_string(attempt));
-            PumpMessagesFor(150);
-            continue;
-        }
-        if (!EmptyClipboard()) {
-            DesignerLog::Write(
-                "UI_EVENT clipboard empty_failed err=" + std::to_string(GetLastError()));
-            CloseClipboard();
-            continue;
-        }
-        HGLOBAL wideMemory = GlobalAlloc(
-            GMEM_MOVEABLE, (wideText.size() + 1) * sizeof(wchar_t));
-        if (wideMemory != nullptr) {
-            void* destination = GlobalLock(wideMemory);
-            std::memcpy(
-                destination, wideText.data(), wideText.size() * sizeof(wchar_t));
-            static_cast<wchar_t*>(destination)[wideText.size()] = L'\0';
-            GlobalUnlock(wideMemory);
-            if (SetClipboardData(CF_UNICODETEXT, wideMemory) == nullptr) {
-                DesignerLog::Write(
-                    "UI_EVENT clipboard set_utf16_failed err=" +
-                    std::to_string(GetLastError()));
-                GlobalFree(wideMemory);
-            }
-        }
-        if (!ansiText.empty()) {
-            HGLOBAL ansiMemory = GlobalAlloc(GMEM_MOVEABLE, ansiText.size() + 1);
-            if (ansiMemory != nullptr) {
-                void* destination = GlobalLock(ansiMemory);
-                std::memcpy(destination, ansiText.c_str(), ansiText.size() + 1);
-                GlobalUnlock(ansiMemory);
-                SetClipboardData(CF_TEXT, ansiMemory);
-            }
-        }
-        CloseClipboard();
-        DesignerLog::Write(
-            "UI_EVENT clipboard set_ok bytes=" +
-            std::to_string(wideText.size() * sizeof(wchar_t)));
-        return true;
-    }
-    return false;
-}
-
-bool SetClipboardPageCode(std::string_view utf8Text)
-{
-    return SetClipboardPageCodeWide(Utf8ToWide(utf8Text));
-}
-
-bool ReadClipboardPageCode(std::string& pageCode)
-{
-    pageCode.clear();
-    if (!OpenClipboard(nullptr)) {
-        return false;
-    }
-    bool ok = false;
-    if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
-        HANDLE data = GetClipboardData(CF_UNICODETEXT);
-        const wchar_t* text = data != nullptr
-            ? static_cast<const wchar_t*>(GlobalLock(data))
-            : nullptr;
-        if (text != nullptr) {
-            pageCode = WideToUtf8(text);
-            GlobalUnlock(data);
-            ok = !pageCode.empty();
-        }
-    }
-    CloseClipboard();
-    return ok;
-}
-
-// Restores the previous clipboard text after page-replace operations.
-class ClipboardTextGuard {
-public:
-    ClipboardTextGuard()
-    {
-        ReadClipboardPageCode(m_previous);
-    }
-    ~ClipboardTextGuard()
-    {
-        if (!m_previous.empty()) {
-            SetClipboardPageCode(m_previous);
-        }
-    }
-    ClipboardTextGuard(const ClipboardTextGuard&) = delete;
-    ClipboardTextGuard& operator=(const ClipboardTextGuard&) = delete;
-
-private:
-    std::string m_previous;
-};
 
 bool SubHasParamNamed(int nameRow, const std::string& paramAnsi)
 {
@@ -1422,165 +2003,22 @@ bool EnsureSubParams(
         return true;
     }
 
-    bool ok = true;
-    for (const SubParamSpec& spec : params) {
-        const std::string nameAnsi = WideToAnsi(spec.name);
-        const std::string typeAnsi = WideToAnsi(spec.type);
-        if (SubHasParamNamed(subRow, nameAnsi)) {
-            continue;
-        }
-        InvokeIde(FN_MOVE_CARET, static_cast<DWORD>(subRow), 0);
-        int caretRow = -1;
-        int caretColumn = -1;
-        QueryCaret(caretRow, caretColumn);
-        if (caretRow != subRow) {
-            ok = false;
-            break;
-        }
-        InvokeIde(FN_INSERT_NEW_ARG, 0, 0);
-        PumpMessagesFor(120);
-
-        int argumentRow = -1;
-        for (int row = subRow + 1; row < subRow + 32; ++row) {
-            CellText first{};
-            if (!ReadCell(row, 0, first) || !CellHasData(first)) continue;
-            if (first.type == VT_SUB_NAME && first.isTitle) break;
-            if (first.type == VT_SUB_ARG_NAME && !first.isTitle && first.text.empty()) {
-                argumentRow = row;
-            }
-        }
-        if (argumentRow < 0) {
-            DesignerLog::Write("UI_EVENT sub_param local_row_create=0");
-            ok = false;
-            break;
-        }
-        const int nameColumn = FindRowCellColumnByType(argumentRow, VT_SUB_ARG_NAME);
-        const int typeColumn = FindRowCellColumnByType(argumentRow, VT_SUB_ARG_TYPE);
-        const bool nameSet = nameColumn >= 0 && RenameCellAt(argumentRow, nameColumn, nameAnsi);
-        const bool typeSet = typeColumn >= 0 && RenameCellAt(argumentRow, typeColumn, typeAnsi);
-        DesignerLog::Write(
-            "UI_EVENT sub_param local row=" + std::to_string(argumentRow) +
-            " name_set=" + std::to_string(nameSet ? 1 : 0) +
-            " type_set=" + std::to_string(typeSet ? 1 : 0));
-        if (!nameSet || !typeSet) {
-            ok = false;
-            break;
-        }
-    }
-    if (ok) {
-        for (const SubParamSpec& spec : params) {
-            if (!SubHasParamNamed(subRow, WideToAnsi(spec.name))) {
-                ok = false;
-                break;
-            }
-        }
-    }
+    // FN_INSERT_NEW_ARG was tested against e5.95 and does not create a real
+    // argument row. Invoking it while a modal preview is being dismissed can
+    // also leave the IDE editor context unstable. Do not run that unsupported
+    // route or the old whole-page replacement fallback from the event callback.
+    // The callback and subscription are still written safely; parameters can be
+    // added manually until a dedicated argument-row API is verified.
+    (void)mainWindow;
+    (void)mdiClient;
+    (void)document;
+    (void)subRow;
     DesignerLog::Write(
-        "UI_EVENT sub_param ok=" + std::to_string(ok ? 1 : 0) +
-        " method=local_rows sub=\"" + WideToUtf8(AnsiToWide(subNameAnsi)) + "\"");
-    return ok;
+        "UI_EVENT sub_param ok=0 method=deferred_safe_path sub=\"" +
+        WideToUtf8(AnsiToWide(subNameAnsi)) +
+        "\" reason=unsupported_native_argument_insert_skipped");
+    return false;
 
-    // Attempt 2: whole-page clipboard replace with .参数 lines inserted after
-    // the .子程序 line. Paste ignores the .程序集 name (harmless here - the
-    // assembly name is not being changed) but applies .参数 rows.
-    ClipboardTextGuard clipboardGuard;
-    RunNativeMenuCommand(mainWindow, kMenuSelectAll, "select_all");
-    RunNativeMenuCommand(mainWindow, kMenuCopy, "copy");
-    std::string pageText;
-    if (!ReadClipboardPageCode(pageText)) {
-        DesignerLog::Write("UI_EVENT sub_param page_copy=0");
-        return false;
-    }
-    DesignerLog::Write(
-        "UI_EVENT sub_param page_copy=1 bytes=" + std::to_string(pageText.size()));
-
-    // Keep the page and inserted declarations in the same character domain.
-    // The IDE clipboard accepts Unicode, while its cell API still uses GBK.
-    const std::wstring pageWide = Utf8ToWide(pageText);
-    const std::wstring subNameWide = AnsiToWide(subNameAnsi);
-    const std::wstring subLinePrefixWide = L".子程序 ";
-    size_t insertPosWide = std::wstring::npos;
-    size_t subBlockStartWide = std::wstring::npos;
-    size_t subBlockEndWide = pageWide.size();
-    size_t lineStart = 0;
-    while (lineStart <= pageWide.size()) {
-        const size_t lineEnd = pageWide.find(L"\r\n", lineStart);
-        const size_t lineStop =
-            lineEnd == std::wstring::npos ? pageWide.size() : lineEnd;
-        const std::wstring line = pageWide.substr(lineStart, lineStop - lineStart);
-        if (line.rfind(subLinePrefixWide, 0) == 0) {
-            const std::wstring nameToken = line.substr(subLinePrefixWide.size());
-            const size_t comma = nameToken.find(L',');
-            const std::wstring nameOnly = comma == std::wstring::npos
-                ? nameToken
-                : nameToken.substr(0, comma);
-            if (_wcsicmp(nameOnly.c_str(), subNameWide.c_str()) == 0) {
-                insertPosWide = lineStop == pageWide.size() ? pageWide.size() : lineEnd + 2;
-                subBlockStartWide = lineStart;
-            }
-        }
-        if (subBlockStartWide != std::wstring::npos && lineStart > subBlockStartWide &&
-            line.rfind(subLinePrefixWide, 0) == 0) {
-            subBlockEndWide = lineStart;
-            break;
-        }
-        if (lineEnd == std::wstring::npos) {
-            break;
-        }
-        lineStart = lineEnd + 2;
-    }
-    if (insertPosWide == std::wstring::npos) {
-        DesignerLog::Write(
-            "UI_EVENT sub_param sub_line_missing=\"" + WideToUtf8(subNameWide) + "\"");
-        return false;
-    }
-
-    const std::wstring subBlock = pageWide.substr(
-        subBlockStartWide, subBlockEndWide - subBlockStartWide);
-    bool allParamsInPageText = true;
-    for (const SubParamSpec& spec : params) {
-        const std::wstring declaration = std::wstring(L".参数 ") + spec.name + L",";
-        if (subBlock.find(declaration) == std::wstring::npos) {
-            allParamsInPageText = false;
-            break;
-        }
-    }
-    if (allParamsInPageText) {
-        DesignerLog::Write(
-            "UI_EVENT sub_param ok=1 method=page_text_existing sub=\"" +
-            WideToUtf8(subNameWide) + "\"");
-        return true;
-    }
-
-    std::wstring paramLinesWide;
-    for (const SubParamSpec& spec : params) {
-        paramLinesWide += std::wstring(L".参数 ") + spec.name + L", " +
-            spec.type + L"\r\n";
-    }
-    std::wstring modifiedWide = pageWide;
-    modifiedWide.insert(insertPosWide, paramLinesWide);
-
-    if (!SetClipboardPageCodeWide(modifiedWide)) {
-        DesignerLog::Write("UI_EVENT sub_param clipboard_set=0");
-        return false;
-    }
-    RunNativeMenuCommand(mainWindow, kMenuSelectAll, "select_all");
-    RunNativeMenuCommand(mainWindow, kMenuPaste, "paste");
-    PumpMessagesFor(kPasteSettleMs);
-    DesignerLog::Write(
-        "UI_EVENT sub_param page_paste bytes=" +
-        std::to_string(modifiedWide.size() * sizeof(wchar_t)));
-
-    ok = true;
-    for (const SubParamSpec& spec : params) {
-        if (!SubHasParamNamed(subRow, WideToAnsi(spec.name))) {
-            ok = false;
-        }
-    }
-    DesignerLog::Write(
-        "UI_EVENT sub_param ok=" + std::to_string(ok ? 1 : 0) +
-        " method=page_replace sub=\"" + WideToUtf8(AnsiToWide(subNameAnsi)) + "\"");
-    return ok;
 }
 
 // Earlier revisions typed ".参数" text into the statement area; those lines
@@ -1588,6 +2026,7 @@ bool EnsureSubParams(
 // parameter rows stand alone.
 void CleanupBogusParamStatements(const std::string& subNameAnsi, int subRow)
 {
+    (void)subNameAnsi;
     const StatementArea area = ScanSubStatementArea(subRow);
     int cleaned = 0;
     for (const auto& entry : area.lines) {
@@ -1606,22 +2045,67 @@ void CleanupBogusParamStatements(const std::string& subNameAnsi, int subRow)
 // Gives a 通讯.订阅 callback subroutine its production signature:
 // .参数 WinId/msg lines, a UTF-8 reminder comment, the 返回 response pointer
 // and 整数型 return type - mirroring ipc_获取二维码 in the reference project.
+// bodyAlreadyWritten is set by the caller that had the hook paste the whole
+// .子程序/.参数/函数体 block: that text is parsed and committed by the IDE's own
+// parser, so the body is complete by construction and must not be re-derived
+// from a page read.
 void SetupSubscribeCallbackBody(
     HWND mainWindow,
     HWND mdiClient,
     HWND document,
     const std::wstring& subNameWide,
-    int subRow)
+    int subRow,
+    bool bodyAlreadyWritten = false,
+    const std::string& knownPageTextUtf8 = std::string())
 {
     const std::string subAnsi = WideToAnsi(subNameWide);
     if (subAnsi.empty() || subRow < 0) {
+        // Every check below is anchored on a physical row, so an unresolved row
+        // means the signature and body are never looked at - the subroutine is
+        // left exactly as the paste made it. That used to show up in the log as
+        // nothing at all, which reads like a step that passed.
+        DesignerLog::Write(
+            "UI_EVENT callback_body_unchecked sub=\"" + WideToUtf8(subNameWide) +
+            "\" sub_row=" + std::to_string(subRow));
         return;
     }
     CleanupBogusParamStatements(subAnsi, subRow);
+
+    // Every question below is "is this part of the signature already there".
+    // The grid reader stops at the fold, so on a page taller than the editor it
+    // answers "no" for a subroutine below it, and acting on that answer is what
+    // wrote a second 返回 line - EnsureSubParams would just as happily add a
+    // second 参数 row the same way. The page source has no fold, so read it once
+    // here and let it decide all of them. The caller's copy is from this same
+    // event, so re-reading would only select-all the page again for the same
+    // answer.
+    std::string pageText = knownPageTextUtf8;
+    std::string blockCompact;
+    // The caller reads the page once per event through the memory bridge and
+    // hands the text down. Reading it again here would render the same page for
+    // the same answer, and doing it from this depth is what used to move the
+    // caret around while the user was still looking at the preview.
+    const bool pageReadable = !pageText.empty();
+    const bool blockFound = pageReadable &&
+        SubBlockCompactFromPageText(pageText, WideToUtf8(subNameWide), blockCompact);
+
     const std::vector<SubParamSpec> params = {
         {L"WinId", L"整数型"}, {L"msg", L"文本型"}};
-    const bool paramsOk = EnsureSubParams(
-        mainWindow, mdiClient, document, subAnsi, subRow, params);
+    // A block this event just pasted carries its own .参数 rows: the IDE parsed
+    // the whole .子程序/.参数/函数体 text in one go, so it is complete by
+    // construction and re-deriving it from a page read can only get it wrong.
+    bool textHasAllParams = bodyAlreadyWritten || blockFound;
+    if (!bodyAlreadyWritten) {
+        for (const SubParamSpec& spec : params) {
+            const std::string tag = WideToUtf8(std::wstring(L".参数") + spec.name + L",");
+            if (blockCompact.find(tag) == std::string::npos) {
+                textHasAllParams = false;
+                break;
+            }
+        }
+    }
+    const bool paramsOk = textHasAllParams ||
+        EnsureSubParams(mainWindow, mdiClient, document, subAnsi, subRow, params);
     // Page replacement inserts argument rows and shifts physical row numbers.
     // Refresh the callback row once before writing its body/type.
     const PageScanResult refreshedSub = ScanPageForType(VT_SUB_NAME, subAnsi, false);
@@ -1633,50 +2117,98 @@ void SetupSubscribeCallbackBody(
     const std::string returnText =
         WideToAnsi(L"返回 (JadeView.文本.创建指针 (\"ok\"))\r\n");
     const std::string returnToken = WideToAnsi(L"JadeView.文本.创建指针");
-    const StatementArea bodyArea = ScanSubStatementArea(subRow);
-    bool hasMsgConversion = false;
-    bool hasReturnStatement = false;
     int keptMsgRow = -1;
     int keptReturnRow = -1;
-    for (const auto& entry : bodyArea.lines) {
-        const bool hasMsg = entry.second.find(msgToken) != std::string::npos;
-        const bool hasReturn = entry.second.find(returnToken) != std::string::npos;
-        if (hasMsg && hasReturn) {
-            RenameCellAt(entry.first, 0, std::string());
-            continue;
-        }
-        if (hasMsg) {
-            if (keptMsgRow >= 0) {
+    int bodyLineCount = 0;
+    int bodyLastRow = -1;
+    // Finds the two body lines and clears any copy beyond the first of each.
+    // Re-runnable: a second pass has nothing left to clear.
+    auto scanBody = [&]() {
+        keptMsgRow = -1;
+        keptReturnRow = -1;
+        const StatementArea bodyArea = ScanSubStatementArea(subRow);
+        bodyLineCount = static_cast<int>(bodyArea.lines.size());
+        bodyLastRow = bodyArea.lastRow;
+        for (const auto& entry : bodyArea.lines) {
+            const bool hasMsg = entry.second.find(msgToken) != std::string::npos;
+            const bool hasReturn = entry.second.find(returnToken) != std::string::npos;
+            if (hasMsg && hasReturn) {
                 RenameCellAt(entry.first, 0, std::string());
+                continue;
             }
-            else {
-                keptMsgRow = entry.first;
+            if (hasMsg) {
+                if (keptMsgRow >= 0) {
+                    RenameCellAt(entry.first, 0, std::string());
+                }
+                else {
+                    keptMsgRow = entry.first;
+                }
+            }
+            if (hasReturn) {
+                if (keptReturnRow >= 0) {
+                    RenameCellAt(entry.first, 0, std::string());
+                }
+                else {
+                    keptReturnRow = entry.first;
+                }
             }
         }
-        if (hasReturn) {
-            if (keptReturnRow >= 0) {
-                RenameCellAt(entry.first, 0, std::string());
+    };
+    if (bodyAlreadyWritten) {
+        // Nothing to detect and nothing to append: appending here on a page the
+        // reader could not fully see is what produced two 返回 lines in one
+        // callback. Only the return type still needs asserting below.
+        DesignerLog::Write(
+            "UI_EVENT callback_body_skipped sub=\"" + WideToUtf8(subNameWide) +
+            "\" reason=hook_wrote_body row=" + std::to_string(subRow));
+    }
+    else {
+        // scanBody only clears same-line duplicates it can actually see; it must
+        // not decide what is missing. The grid reader stops at the fold, so on a
+        // page taller than the editor a body line below it reads as absent -
+        // appending on that answer is what wrote a second 返回 into the middle of
+        // a subroutine that already had one. The page's own source text has no
+        // fold, so it makes the call.
+        scanBody();
+        const std::string msgTokenUtf8 = WideToUtf8(L"UTF8文本到GBK文本(msg)");
+        const std::string returnTokenUtf8 = WideToUtf8(L"JadeView.文本.创建指针");
+        const bool textHasMsg =
+            blockFound && blockCompact.find(msgTokenUtf8) != std::string::npos;
+        const bool textHasReturn =
+            blockFound && blockCompact.find(returnTokenUtf8) != std::string::npos;
+        DesignerLog::Write(
+            "UI_EVENT callback_body_text sub=\"" + WideToUtf8(subNameWide) +
+            "\" page_ok=" + std::to_string(pageReadable ? 1 : 0) +
+            " block_found=" + std::to_string(blockFound ? 1 : 0) +
+            " text_msg=" + std::to_string(textHasMsg ? 1 : 0) +
+            " text_return=" + std::to_string(textHasReturn ? 1 : 0) +
+            " grid_msg_row=" + std::to_string(keptMsgRow) +
+            " grid_return_row=" + std::to_string(keptReturnRow) +
+            " lines=" + std::to_string(bodyLineCount) +
+            " last_row=" + std::to_string(bodyLastRow));
+        if (blockFound) {
+            if (!textHasMsg) {
+                AppendStatementsIfMissing(
+                    mdiClient, document, subAnsi, msgText, msgToken, subRow);
             }
-            else {
-                keptReturnRow = entry.first;
+            if (!textHasReturn) {
+                AppendStatementsIfMissing(
+                    mdiClient, document, subAnsi, returnText, returnToken, subRow);
             }
         }
-    }
-    hasMsgConversion = keptMsgRow >= 0;
-    hasReturnStatement = keptReturnRow >= 0;
-    if (!hasMsgConversion && !hasReturnStatement) {
-        AppendStatementsIfMissing(
-            mdiClient, document, subAnsi, msgText, msgToken, subRow);
-        AppendStatementsIfMissing(
-            mdiClient, document, subAnsi, returnText, returnToken, subRow);
-    }
-    else if (!hasMsgConversion) {
-        AppendStatementsIfMissing(
-            mdiClient, document, subAnsi, msgText, msgToken, subRow);
-    }
-    else if (!hasReturnStatement) {
-        AppendStatementsIfMissing(
-            mdiClient, document, subAnsi, returnText, returnToken, subRow);
+        else {
+            // Only a source that can see the whole page gets to say a line is
+            // missing. The grid answers per materialised cell, so a body line
+            // the editor has not laid out reads as absent no matter how many
+            // times it is asked - and appending on that answer is what put a
+            // second 返回 inside a subroutine that already had one. A line that
+            // is genuinely missing is a one-line manual fix; a duplicate 返回
+            // does not compile.
+            DesignerLog::Write(
+                "UI_EVENT callback_body_unverified sub=\"" + WideToUtf8(subNameWide) +
+                "\" page_ok=" + std::to_string(pageReadable ? 1 : 0) +
+                " append_skipped=1 reason=page_source_unavailable");
+        }
     }
     const bool retTypeOk = SetSubReturnType(subRow, WideToAnsi(L"整数型"));
     DesignerLog::Write(
@@ -1749,16 +2281,128 @@ void EnsureLifecycleCallbackBody(
     }
 }
 
-bool JumpToSubroutine(const std::string& subNameAnsi)
+// hintRow is the row a previous lookup resolved for this subroutine. Statements
+// inserted above it since then shift it by a few lines, so it is a place to
+// start looking, never a destination to jump to blindly.
+constexpr int kJumpHintReach = 40;
+
+// A plain scan only sees the rows the grid has materialised, so on a page taller
+// than the editor every subroutine below the fold reads as absent and the jump
+// silently does nothing - which is why the caret stopped following the later
+// buttons. Moving the caret to the hint first brings that stretch of the page
+// into view, and only then can its name cell be read and confirmed.
+// Completes a jump when the caller already resolved the physical name cell.
+// This intentionally does not scan, copy, select, or rewrite the page.
+bool JumpToLocatedSubroutine(
+    const std::string& subNameAnsi,
+    int targetRow,
+    int targetColumn)
 {
-    const PageScanResult cell = ScanPageForType(VT_SUB_NAME, subNameAnsi, false);
-    if (cell.matchRow < 0) {
+    if (targetRow < 0 || targetColumn < 0) {
         return false;
     }
-    return InvokeIde(
+    InvokeIde(
         FN_MOVE_CARET,
-        static_cast<DWORD>(cell.matchRow),
-        static_cast<DWORD>(cell.matchColumn));
+        static_cast<DWORD>(targetRow),
+        static_cast<DWORD>(targetColumn));
+    int landedRow = -1;
+    int landedColumn = -1;
+    QueryCaret(landedRow, landedColumn);
+    const bool landed = landedRow == targetRow;
+    DesignerLog::Write(
+        "UI_EVENT fast_jump sub=\"" + WideToUtf8(AnsiToWide(subNameAnsi)) +
+        "\" target_row=" + std::to_string(targetRow) +
+        " landed_row=" + std::to_string(landedRow) +
+        " ok=" + std::to_string(landed ? 1 : 0));
+    return landed;
+}
+
+// knownPageTextUtf8 is any render of this page the caller still holds. Lines
+// inserted since then only shift the target, which the hint probe absorbs.
+bool JumpToSubroutine(
+    const std::string& subNameAnsi,
+    int hintRow = -1,
+    const std::string& knownPageTextUtf8 = std::string())
+{
+    if (ResolveRowFromProgramTree(subNameAnsi) >= 0) return true;
+    int targetRow = -1;
+    int targetColumn = 0;
+    const PageScanResult cell = ScanPageForType(VT_SUB_NAME, subNameAnsi, false);
+    if (cell.matchRow >= 0) {
+        targetRow = cell.matchRow;
+        targetColumn = cell.matchColumn;
+    }
+    if (targetRow < 0 && hintRow >= 0) {
+        InvokeIde(FN_MOVE_CARET, static_cast<DWORD>(hintRow), 0);
+        PumpMessagesFor(60);
+        const int first = hintRow > kJumpHintReach ? hintRow - kJumpHintReach : 0;
+        const int last = hintRow + kJumpHintReach;
+        for (int row = first; row <= last && row < kMaximumRowsToScan && targetRow < 0; ++row) {
+            for (int column = 0; column < kMaximumColumnsToScan; ++column) {
+                CellText probe;
+                if (!ReadCell(row, column, probe) || !CellHasData(probe)) {
+                    continue;
+                }
+                if (probe.type != VT_SUB_NAME || probe.text.empty()) {
+                    continue;
+                }
+                if (_stricmp(probe.text.c_str(), subNameAnsi.c_str()) == 0) {
+                    targetRow = row;
+                    targetColumn = column;
+                    break;
+                }
+            }
+        }
+    }
+    if (targetRow < 0) {
+        // Ask the page text where the block is before walking the page to find
+        // out. Both preceding attempts read the grid, which stops at the fold;
+        // the text does not, and its line index aims the caret straight at the
+        // target instead of dragging a window across everything above it.
+        std::string pageText = knownPageTextUtf8;
+        if (pageText.empty()) {
+            ReadPageCodeUtf8(pageText);
+        }
+        const int row = ResolveRowFromPageText(
+            pageText, subNameAnsi, WideToUtf8(AnsiToWide(subNameAnsi)));
+        if (row >= 0) {
+            targetRow = row;
+            targetColumn = 0;
+        }
+    }
+    if (targetRow < 0) {
+        std::vector<int> rows;
+        int nameCells = 0;
+        int lastRow = -1;
+        int documentLastRow = -1;
+        CollectSubroutineRowsWindowed(
+            subNameAnsi, rows, nameCells, lastRow, documentLastRow);
+        if (!rows.empty()) {
+            targetRow = rows.front();
+            targetColumn = 0;
+        }
+    }
+    if (targetRow < 0) {
+        DesignerLog::Write(
+            "UI_EVENT jump_locate=0 sub=\"" + WideToUtf8(AnsiToWide(subNameAnsi)) +
+            "\" hint_row=" + std::to_string(hintRow));
+        return false;
+    }
+    InvokeIde(
+        FN_MOVE_CARET,
+        static_cast<DWORD>(targetRow),
+        static_cast<DWORD>(targetColumn));
+    int landedRow = -1;
+    int landedColumn = -1;
+    QueryCaret(landedRow, landedColumn);
+    const bool landed = landedRow == targetRow;
+    DesignerLog::Write(
+        "UI_EVENT jump sub=\"" + WideToUtf8(AnsiToWide(subNameAnsi)) +
+        "\" hint_row=" + std::to_string(hintRow) +
+        " target_row=" + std::to_string(targetRow) +
+        " landed_row=" + std::to_string(landedRow) +
+        " ok=" + std::to_string(landed ? 1 : 0));
+    return landed;
 }
 
 // Locates (or creates) the assembly page and the subroutine inside it. This
@@ -1767,7 +2411,8 @@ PageEnsureResult EnsureAssemblySubPage(
     HWND mainWindow,
     HWND mdiClient,
     const std::wstring& assembly,
-    const std::wstring& subName)
+    const std::wstring& subName,
+    const std::string& initialSource)
 {
     PageEnsureResult out;
     const std::string subAnsi = WideToAnsi(subName);
@@ -1779,8 +2424,14 @@ PageEnsureResult EnsureAssemblySubPage(
         return out;
     }
 
-    HWND targetDocument = FindMdiDocument(mdiClient, assembly);
-    if (targetDocument == nullptr) {
+    const auto found = LookupAssemblyPage(mainWindow, mdiClient, assembly);
+    if (found.state != ProjectAssembly::State::Absent &&
+        (found.state != ProjectAssembly::State::Found || !found.document)) {
+        out.message = AssemblyLookupFailure(found, assembly);
+        return out;
+    }
+    HWND targetDocument = found.document;
+    if (found.state == ProjectAssembly::State::Absent) {
         HWND nativeDocument = FindAnyNativeMdiDocument(mdiClient);
         if (!ActivateDocument(mdiClient, nativeDocument)) {
             out.message = "没有可用于创建程序集的原生代码页";
@@ -1806,97 +2457,61 @@ PageEnsureResult EnsureAssemblySubPage(
         out.message = "找到目标程序集，但无法激活其代码页";
         return out;
     }
-    else {
-        RememberAssemblyDocument(assembly, targetDocument);
-    }
-
-    PageScanResult subCell = ScanPageForType(VT_SUB_NAME, subAnsi, false);
-    PageScanResult anySub = ScanPageForType(VT_SUB_NAME, std::string(), true);
-    for (int attempt = 0; subCell.matchRow < 0 && attempt < 4; ++attempt) {
-        PumpMessagesFor(100);
-        subCell = ScanPageForType(VT_SUB_NAME, subAnsi, false);
-        anySub = ScanPageForType(VT_SUB_NAME, std::string(), true);
-    }
-    const bool lookingForFixedSubscription =
-        _wcsicmp(assembly.c_str(), kSubscribeAssembly) == 0 &&
-        _wcsicmp(subName.c_str(), kSubscribeSub) == 0;
-    if (subCell.matchRow < 0 && lookingForFixedSubscription) {
-        int savedRow = -1;
-        int savedColumn = -1;
-        QueryCaret(savedRow, savedColumn);
-        InvokeIde(FN_MOVE_PAGE_HOME, 0, 0);
-        PumpMessagesFor(100);
-        subCell = ScanPageForType(VT_SUB_NAME, subAnsi, false);
-        anySub = ScanPageForType(VT_SUB_NAME, std::string(), true);
-        if (subCell.matchRow < 0) {
-            InvokeIde(FN_MOVE_TOP, 0, 0);
-            PumpMessagesFor(100);
-            subCell = ScanPageForType(VT_SUB_NAME, subAnsi, false);
-            anySub = ScanPageForType(VT_SUB_NAME, std::string(), true);
-        }
-        if (subCell.matchRow < 0) {
-            InvokeIde(FN_MOVE_CARET, 0, 0);
-            PumpMessagesFor(100);
-            subCell = ScanPageForType(VT_SUB_NAME, subAnsi, false);
-            anySub = ScanPageForType(VT_SUB_NAME, std::string(), true);
-        }
-        if (savedRow >= 0 && savedColumn >= 0) {
-            InvokeIde(FN_MOVE_CARET, static_cast<DWORD>(savedRow), static_cast<DWORD>(savedColumn));
-        }
-    }
-    const bool textHealthy = anySub.nonEmptyTextCells > 0 || subCell.matchRow >= 0;
-    const bool emptyAssemblyPage =
-        ScanPageForType(VT_MOD_NAME, std::string(), true).matchRow >= 0;
-    const bool fixedSubscriptionMissing =
-        lookingForFixedSubscription &&
-        textHealthy && !out.createdAssembly;
-    DesignerLog::Write(
-        "UI_EVENT page_state target=\"" + asmUtf8 + "\" created_new=" +
-        std::to_string(out.createdAssembly ? 1 : 0) +
-        " sub_exists=" + std::to_string(subCell.matchRow >= 0 ? 1 : 0) +
-        " text_healthy=" + std::to_string(textHealthy ? 1 : 0));
-
-    if (subCell.matchRow < 0 && fixedSubscriptionMissing) {
-        out.message = "固定子程序索引未稳定，为避免生成第二个 Jade_通讯_订阅 已停止";
-        return out;
-    }
-    if (subCell.matchRow < 0 && (out.createdAssembly || textHealthy || emptyAssemblyPage)) {
-        if (!CreateSubroutineAtPage(subAnsi)) {
-            PumpMessagesFor(150);
-            const PageScanResult recoveredSub =
-                ScanPageForType(VT_SUB_NAME, subAnsi, false);
-            if (recoveredSub.matchRow >= 0) {
-                out.subRow = recoveredSub.matchRow;
-                out.document = targetDocument;
-                out.ok = true;
-                return out;
-            }
-            out.message = "无法在代码页创建子程序（两种原生路径均未生效）";
-            return out;
-        }
-        out.createdSubroutine = true;
-    }
-    else if (subCell.matchRow < 0) {
-        out.message = "文本回读异常且无法确认子程序是否已存在，为避免重复创建已停止";
-        return out;
-    }
-
+    // Rename before looking up source text, so every read verifies its owner.
     if (out.createdAssembly) {
         if (!RenameAssemblyViaApi(targetDocument, asmAnsi)) {
             out.message =
                 "通过内部接口重命名为 " + asmUtf8 + " 未通过回读/标题验证，已按规则停止";
             return out;
         }
-        RememberAssemblyDocument(assembly, targetDocument);
         DesignerLog::Write(
             "UI_EVENT assembly_renamed name=\"" + asmUtf8 +
             "\" title=\"" + WideToUtf8(GetWindowTitle(targetDocument)) + "\"");
     }
-    // Capture the subroutine's row right now, while the page context is
-    // freshly verified; a later name re-scan races with the IDE's lazy
-    // subroutine index and can fail even though the sub exists.
-    const PageScanResult finalSub = ScanPageForType(VT_SUB_NAME, subAnsi, false);
-    out.subRow = finalSub.matchRow;
+    std::string pageText;
+    if (!ReadPageCodeUtf8(pageText) || !ParsePageCode(pageText).valid ||
+        !ProjectAssembly::MatchesDocumentTitle(
+            L"程序集: " + Utf8ToWide(ParsePageCode(pageText).assemblyUtf8), assembly)) {
+        out.message = "目标程序集代码页读取失败或名称不一致，已停止写入";
+        return out;
+    }
+    const auto sub = LookupSubroutine(mdiClient, targetDocument, subAnsi, pageText);
+    if (sub.duplicateRows > 1 || sub.state == SubLookupState::Unreadable) {
+        out.message = "子程序存在同名冲突或无法读取，已停止写入：" + subUtf8;
+        return out;
+    }
+    if (sub.state == SubLookupState::ConfirmedAbsent) {
+        if (!initialSource.empty()) {
+            InvokeIde(FN_MOVE_BOTTOM, 0, 0);
+            std::string error;
+            const bool inserted = HookBridge::InsertAnsi(initialSource, error);
+            PumpMessagesFor(180);
+            const auto written = ConfirmMemoryWrite(subAnsi);
+            DesignerLog::Write("HYBRID memory_shared_callback success=" +
+                std::to_string(inserted ? 1 : 0) + " confirmed=" +
+                std::to_string(written.present ? 1 : 0) + " row=" + std::to_string(written.row));
+            if (!written.pageReadable || !written.present) {
+                out.message = "目标程序集内未确认回调代码已写入，已停止后续写入：" + error;
+                return out;
+            }
+            out.subRow = written.row;
+        }
+        else {
+            if (!CreateSubroutineAtPage(subAnsi)) {
+                out.message = "原生子程序创建未确认，已停止后续写入";
+                return out;
+            }
+            out.subRow = ConfirmMemoryWrite(subAnsi).row;
+        }
+        out.createdSubroutine = true;
+    }
+    else {
+        out.subRow = sub.row;
+    }
+    if (out.subRow < 0) {
+        out.message = "子程序已存在，但无法定位编辑行，已停止写入：" + subUtf8;
+        return out;
+    }
     out.document = targetDocument;
     out.ok = true;
     return out;
@@ -1904,7 +2519,181 @@ PageEnsureResult EnsureAssemblySubPage(
 
 } // namespace
 
+#include "CommonCode.h"
+#include "DesignerInspection.h"
+
 namespace IdeEventRouter {
+
+void ToggleNativeComponentBar() { InvokeIde(FN_SWITCH_UNIT_BAR); }
+
+std::vector<ProjectHealth::Check> InspectProjectHealth()
+{
+    const auto host=HookBridge::InspectHost();
+    if(!host.ok())return {{"error","IDE 兼容性","请使用配套的 e5.95.exe，当前为 "+host.exeNameUtf8}};
+    auto checks=ProjectHealth::Inspect(
+        [](const auto& name,auto& text,auto& error){return HookBridge::ReadAssembly(WideToAnsi(Utf8ToWide(name)),text,error);},
+        [](const auto& name,auto& text,auto& error){return HookBridge::ReadRoutine(WideToAnsi(Utf8ToWide(name)),text,error);});
+    checks.insert(checks.begin(),{"ok","IDE 兼容性","内存桥宿主检查通过"});
+    return checks;
+}
+
+BindingInfo InspectBinding(const UiEvent& event)
+{
+    BindingInfo info{event,"unknown",{}};
+    if (IsWindowControlEvent(event) || event.callType == "JadeView.App.注册事件") {
+        info.message="窗口控制或原生生命周期事件，不在普通控件修复范围"; return info;
+    }
+    if (event.handlerName.empty() && event.callType.empty()) {
+        info.message="缺少稳定回调名称"; return info;
+    }
+    auto handler=Utf8ToWide(event.handlerName);
+    if (handler.empty() && event.callType=="JadeView.通讯.订阅" && !event.callParam.empty())
+        handler=DeriveIpcNameFromChannel(Utf8ToWide(event.callParam));
+    if (handler.empty() && IsCommonInteractiveControl(event) && !event.elementId.empty())
+        handler=Utf8ToWide(event.elementId)+DefaultHandlerSuffix(event);
+    handler=SanitizeIdentifier(handler,L"Jade事件");
+    auto assembly=event.assemblyName.empty() ? std::wstring() : SanitizeIdentifier(Utf8ToWide(event.assemblyName),kSubscribeAssembly);
+    if (assembly.empty()) assembly=StartsWithInsensitive(handler,L"ipc_") || StartsWithInsensitive(handler,L"UI_") ? kSharedAssembly : kSubscribeAssembly;
+    info.normalized.handlerName=WideToUtf8(handler);
+    info.normalized.assemblyName=WideToUtf8(assembly);
+    info.normalized.callParam=event.callParam.empty() ? "ui:"+event.elementId : event.callParam;
+    std::string source, subscriptions, error;
+    const int read=HookBridge::ReadAssembly(WideToAnsi(assembly),source,error);
+    const int subRead=assembly==kSubscribeAssembly ? read : HookBridge::ReadAssembly(WideToAnsi(kSubscribeAssembly),subscriptions,error);
+    if (assembly==kSubscribeAssembly) subscriptions=source;
+    if (read<0 || subRead<0) { info.message="内存读取未完成："+error; return info; }
+    const auto routines=DesignerInspection::Routines(source);
+    const int copies=DesignerInspection::Count(routines,info.normalized.handlerName);
+    const auto subs=DesignerInspection::Routines(subscriptions);
+    if (copies>1 || DesignerInspection::Count(subs,WideToUtf8(kSubscribeSub))>1) {
+        info.status="conflict"; info.message="同名子程序重复，未自动修改"; return info;
+    }
+    std::string block;
+    for(const auto& routine:subs) if(routine.name==WideToUtf8(kSubscribeSub)) block=routine.source;
+    int exact=0; bool conflicting=false;
+    std::istringstream lines(block); std::string line;
+    while(std::getline(lines,line)) {
+        std::string channel,target;
+        if(!DesignerInspection::Subscription(line,channel,target) || channel!=info.normalized.callParam) continue;
+        if (_stricmp(target.c_str(),info.normalized.handlerName.c_str())==0) ++exact;
+        else conflicting=true;
+    }
+    if (exact>1 || conflicting) { info.status="conflict"; info.message="订阅重复或同一频道指向其他回调"; }
+    else if (copies==1 && exact==1) { info.status="complete"; info.message="回调与订阅均已存在"; }
+    else { info.status="missing"; info.message=copies==0 ? "缺少回调或程序集" : "缺少订阅"; }
+    return info;
+}
+
+RouteResult OperateBinding(HWND mainWindow, HWND mdiClient, const UiEvent& event, bool locateOnly)
+{
+    const auto current=InspectBinding(event);
+    if (locateOnly) {
+        if(current.status!="complete" && current.status!="missing") return Fail("inspect",current.message);
+        std::string source,error;
+        if(HookBridge::ReadAssembly(WideToAnsi(Utf8ToWide(current.normalized.assemblyName)),source,error)!=1 ||
+            DesignerInspection::Count(DesignerInspection::Routines(source),current.normalized.handlerName)!=1)
+            return Fail("locate","回调不存在或不唯一，未创建代码");
+        const bool ok=ProjectAssembly::JumpToSubroutine(mainWindow,mdiClient,Utf8ToWide(current.normalized.assemblyName),Utf8ToWide(current.normalized.handlerName));
+        return {ok,"locate",ok ? "已定位回调" : "定位未完成，未写入代码"};
+    }
+    if(current.status=="complete") return {true,"preserved","绑定已完整，无需补齐"};
+    if(current.status!="missing") return Fail("repair",current.message);
+    return Route(mainWindow,mdiClient,current.normalized);
+}
+
+CommonPreview PreviewCommonCode(HWND mainWindow, CommonCode::Options options)
+{
+    CommonPreview out;
+    if(options.appId.empty()) {
+        wchar_t title[4096]{}; GetWindowTextW(mainWindow,title,4096); std::wstring path;
+        if(!ExtractProjectPath(title,path)) { out.report="请先保存工程或填写应用标识"; return out; }
+        options.appId=CommonCode::ProjectAppId(path);
+    }
+    out.options=options;
+    out.source=WideToUtf8(CommonCode::BuildSource(options));
+    if(out.source.empty()) { out.report="应用标识不合法"; return out; }
+    std::string error;
+    const int found=HookBridge::ReadAssembly(WideToAnsi(CommonCode::Assembly),out.existing,error);
+    if(found<0) { out.report="公共程序集内存读取失败："+error; return out; }
+    out.ready=found==0;
+    const auto existing=DesignerInspection::Routines(out.existing);
+    for(const auto& r:DesignerInspection::Routines(out.source)) {
+        const int n=DesignerInspection::Count(existing,r.name);
+        out.report += (n==0 ? "新增候选：" : n==1 ? "保留现有：" : "重复冲突：")+r.name+"\n";
+    }
+    if(found) out.report += "已有公共代码：仅提供新旧对照，禁止整页覆盖。请人工合并差异。\n";
+    struct Requirement { const wchar_t* type; const char* method; int count; };
+    std::vector<Requirement> requirements={
+        {L"_JadeViewApp","初始化",6},{L"_JadeViewApp","注册事件",2},{L"_JadeViewApp","消息循环",0},{L"_JadeViewApp","退出",0},
+        {L"_JadeView_窗口","创建",4},{L"_JadeView_窗口","最小化",1},{L"_JadeView_窗口","最大化切换",1},{L"_JadeView_窗口","销毁",1},
+        {L"_JadeView_IPC","订阅",2},{L"_JadeView_自定义协议服务","创建服务",2}};
+    if(options.tray || options.singleInstance) {
+        requirements.push_back({L"_JadeView_窗口","设置窗口显示或隐藏",2});
+        requirements.push_back({L"_JadeView_窗口","设置焦点",1});
+    }
+    if(options.tray) {
+        for(auto name:{"创建","销毁","显示图标","设置图标","设置提示文本","设置菜单项"})
+            requirements.push_back({L"_JadeView_托盘",name,std::string(name)=="创建" ? 0 : (std::string(name)=="销毁" || std::string(name)=="显示图标" ? 1 : 2)});
+        requirements.push_back({L"类_json","解析",3});
+        requirements.push_back({L"类_json","取通用属性",2});
+        requirements.push_back({L"类_json","取属性数值",1});
+    }
+    std::map<std::wstring,std::string> modules;
+    for(const auto& r:requirements) {
+        if(!modules.contains(r.type)) {
+            std::string text;
+            if(HookBridge::ReadAssembly(WideToAnsi(r.type),text,error)!=1) text.clear();
+            modules.emplace(r.type,std::move(text));
+        }
+        if(!DesignerInspection::Method(modules[r.type],r.method,r.count)) {
+            out.ready=false;
+            out.report += "缺少或签名不匹配："+WideToUtf8(r.type)+"."+r.method+"（参数 "+std::to_string(r.count)+" 个）\n";
+        }
+    }
+    out.report += "检查范围：当前工程内存中的方法名称和参数数量；运行 DLL 版本及实际行为仍需运行验证。\n";
+    return out;
+}
+
+RouteResult GenerateCommonCode(HWND mainWindow, CommonCode::Options options)
+{
+    if (!IsWindow(mainWindow)) return Fail("common", "易语言窗口尚未准备好");
+    if (g_routingInProgress.exchange(true)) return Fail("common", "正在处理其他操作，请稍后重试");
+    RoutingGuard guard;
+    ResetSessionCachesIfProjectChanged(mainWindow);
+    if (!HookBridge::InspectHost().ok()) return Fail("common", "请使用配套的 e5.95.exe 打开项目");
+    if (options.appId.empty()) {
+        wchar_t title[4096]{};
+        GetWindowTextW(mainWindow,title,4096);
+        std::wstring projectPath;
+        if (!ExtractProjectPath(title,projectPath)) return Fail("common", "请先保存工程，或填写独立应用标识。");
+        options.appId = CommonCode::ProjectAppId(projectPath);
+    }
+    const std::wstring source = CommonCode::BuildSource(options);
+    if (source.empty()) return Fail("common", "应用标识需要 6～64 位英文字母、数字、下划线或短横线。");
+    std::string reason;
+    const int result = HookBridge::EnsureCommon(WideToAnsi(CommonCode::Assembly),
+        WideToAnsi(source), WideToAnsi(CommonCode::SubscriptionAssembly),
+        WideToAnsi(CommonCode::SubscriptionRoutine), reason);
+    if (result == 1) return {true, "common_created",
+        std::string("公共代码已创建；在现有启动入口调用 Jade_公共_启动 ()。已有入口未修改。") +
+        ((options.tray || options.singleInstance) ? "窗口恢复要求 JadeView DLL 2.3 或更新。" : "") +
+        (options.tray ? "托盘需类_json及程序目录 app.ico，失败时正常关闭退出。" : "")};
+    if (result == 2) return {true, "common_exists", "公共代码已存在，保留你的修改，未重复生成。"};
+    if (reason == "common_profile_conflict") return Fail("common",
+        "已有公共代码与所选配置不同，未覆盖。请保留原代码并人工合并；尚未修改的新生成代码可撤销后重选。" );
+    if (reason == "common_json_dependency_missing") return Fail("common",
+        "托盘需要类_json，当前工程未找到。请先导入提供该类的精易模块，再生成；工程未修改。");
+    if (reason == "common_window_channel_conflict") return Fail("common",
+        "已有 win:minimize / win:maximize / win:close 通道代码，已停止生成，避免覆盖原有窗口行为。" );
+    if (reason.find("conflict") != std::string::npos || reason == "common_existing_incomplete")
+        return Fail("common", "已有同名子程序或不完整的公共程序集，未覆盖。请查看 JadeDesigner.log。");
+    return Fail("common", "公共代码未生成，请确认已导入 JadeView.ec 并使用配套 DLL。原因：" + reason);
+}
+
+std::string DecodeWireField(std::wstring_view value)
+{
+    return PercentDecodeUtf8(value);
+}
 
 bool TryParseWebMessage(std::wstring_view wireMessage, UiEvent& event)
 {
@@ -1924,9 +2713,10 @@ bool TryParseWebMessage(std::wstring_view wireMessage, UiEvent& event)
         event.callType = PercentDecodeUtf8(parts[8]);
         event.callParam = PercentDecodeUtf8(parts[9]);
     }
-    // Channel-subscription events may arrive without a handler name; the
-    // router derives ipc_xxx from the channel mapping table.
-    return !event.handlerName.empty() || !event.callType.empty();
+    // A well-formed JADE_EVT is accepted even when it carries neither a handler
+    // name nor a channel. Rejecting it here made the click vanish without a
+    // word; Route turns it into an explanation the user can act on instead.
+    return true;
 }
 
 RouteResult Route(HWND mainWindow, HWND mdiClient, const UiEvent& event)
@@ -1935,14 +2725,48 @@ RouteResult Route(HWND mainWindow, HWND mdiClient, const UiEvent& event)
         !IsWindow(mainWindow) || !IsWindow(mdiClient)) {
         return Fail("invalid_context", "易语言编辑窗口尚未准备好");
     }
+    if (IsWindowControlEvent(event)) {
+        DesignerLog::Write(
+            "UI_EVENT ignored window_control control=" + event.controlType +
+            " id=\"" + event.elementId + "\" handler=\"" + event.handlerName +
+            "\" param=\"" + event.callParam + "\"");
+        return {true, "ignored_window_control", "已忽略窗口/弹窗控制按钮"};
+    }
     if (g_routingInProgress.exchange(true)) {
         return Fail("busy", "上一个事件仍在处理中，请稍候再操作");
     }
     RoutingGuard routingGuard;
+    ResetSessionCachesIfProjectChanged(mainWindow);
+
+    // Nothing here identifies a callback: no data-jade-handler, no id/name/
+    // title/aria-label to build a stable name from, no inline handler function,
+    // and no channel. Inventing a name from the button's text would rename the
+    // subroutine every time that text changed, so say what is missing instead
+    // of writing a subroutine the user cannot keep.
+    if (event.handlerName.empty() && event.callType.empty()) {
+        DesignerLog::Write(
+            "UI_EVENT no_handler_name dom=" + event.domEvent +
+            " control=" + event.controlType + " id=\"" + event.elementId + "\"");
+        return Fail(
+            "no_handler_name",
+            "该控件（" + event.elementId +
+                "）没有 id/name/title，也没有 onclick 函数或 data-jade-channel，"
+                "无法生成稳定的子程序名；请给它加上 id 或 data-jade-handler");
+    }
 
     std::wstring handler = Utf8ToWide(event.handlerName);
     if (event.callType == "JadeView.通讯.订阅" && handler.empty() && !event.callParam.empty()) {
         handler = DeriveIpcNameFromChannel(Utf8ToWide(event.callParam));
+    }
+    // Older injected pages and hand-written markup may provide only an element
+    // id. Common controls still have a stable identity (for example
+    // btnInfoOk), so derive the conventional callback name instead of silently
+    // rejecting the click.
+    if (handler.empty() && IsCommonInteractiveControl(event) && !event.elementId.empty()) {
+        handler = Utf8ToWide(event.elementId) + DefaultHandlerSuffix(event);
+        DesignerLog::Write(
+            "UI_EVENT derived_handler id=\"" + event.elementId +
+            "\" handler=\"" + WideToUtf8(handler) + "\"");
     }
     handler = SanitizeIdentifier(handler, L"Jade事件");
     const std::string handlerUtf8 = WideToUtf8(handler);
@@ -2013,7 +2837,7 @@ RouteResult Route(HWND mainWindow, HWND mdiClient, const UiEvent& event)
             WideToAnsi(L"JadeView.App.初始化"));
         const bool initReady = EnsureJadeViewStartupSkeleton(
             mainWindow, mdiClient, hookPage.document, registerSubAnsi, hookPage.subRow);
-        const bool jumped = JumpToSubroutine(registerSubAnsi);
+        const bool jumped = JumpToSubroutine(registerSubAnsi, hookPage.subRow);
         DesignerLog::Write(
             "UI_EVENT register hook_appended=" + std::to_string(appended ? 1 : 0) +
             " init_ready=" + std::to_string(initReady ? 1 : 0) +
@@ -2057,125 +2881,488 @@ RouteResult Route(HWND mainWindow, HWND mdiClient, const UiEvent& event)
         return Fail("subscribe", "订阅通道名为空或无法表示");
     }
 
-    if (_wcsicmp(assembly.c_str(), kSubscribeAssembly) == 0 &&
-        FindMdiDocument(mdiClient, std::wstring(kSubscribeAssembly)) == nullptr) {
-        std::string hookError;
-        const bool generated = HookBridge::GenerateAssembly(
-            assemblyAnsi, channelAnsi, handlerAnsi, hookError);
+    // This branch is the hybrid memory-write path.  WebView2 has already queued
+    // the event onto the preview window message queue before Route is entered,
+    // so the private jadehook editor call is no longer made from inside the
+    // WebView callback.  Do not silently replace this with the public IDE path:
+    // the jade-hybrid branch is specifically the memory bridge version.
+    DesignerLog::Write("HYBRID memory_bridge_path assembly=\"" + assemblyUtf8 + "\"");
+
+    // Every write below goes through the hook, and the hook refuses any host but
+    // the e5.95 build it was compiled against - generate, insert and page read
+    // alike, all reporting "generate_invalid_arguments". There is no fallback to
+    // fail over to, so stop here and name the host: the old message sent the
+    // reader after jadehook.dll, which was never the problem.
+    const HookBridge::HostInfo host = HookBridge::InspectHost();
+    if (!host.ok()) {
         DesignerLog::Write(
-            "HYBRID first_generate success=" + std::to_string(generated ? 1 : 0) +
+            "HYBRID host_unsupported host=\"" + host.exeNameUtf8 +
+            "\" name_ok=" + std::to_string(host.nameSupported ? 1 : 0) +
+            " build_ok=" + std::to_string(host.buildSupported ? 1 : 0));
+        return Fail(
+            "subscribe",
+            host.nameSupported
+                ? "当前 e5.95.exe 与内存桥接不是配套版本（编辑器入口特征不符），"
+                  "请换回与 jadehook.dll 配套的 e5.95.exe"
+                : "内存桥接只能在 e5.95.exe 中工作，当前 IDE 进程是 " +
+                      host.exeNameUtf8 +
+                      "；请用 e5.95.exe 打开本项目（双击 .e 文件会启动 e.exe）");
+    }
+
+    // The 0908 variant creates/repairs directly in the project model before
+    // touching MDI documents. A complete event continues to the existing jump
+    // path; a failure must never fall back to activate-then-create.
+    const std::string backgroundStatement =
+        WideToAnsi(L"JadeView.通讯.订阅 (\"") + channelAnsi + WideToAnsi(L"\", &") + handlerAnsi + ")\r\n";
+    const std::string backgroundCallback =
+        WideToAnsi(L".子程序 ") + handlerAnsi + WideToAnsi(L", 整数型\r\n") +
+        WideToAnsi(L".参数 WinId, 整数型\r\n.参数 msg, 文本型\r\n\r\n") +
+        WideToAnsi(L"msg ＝ UTF8文本到GBK文本 (msg)\r\n返回 (JadeView.文本.创建指针 (\"ok\"))\r\n");
+    std::string backgroundError;
+    HookBridge::BackgroundChange backgroundChange = HookBridge::BackgroundChange::Unknown;
+    const int background = HookBridge::EnsureBackground(assemblyAnsi, WideToAnsi(kSubscribeAssembly),
+        WideToAnsi(kSubscribeSub), handlerAnsi, backgroundStatement, backgroundCallback, backgroundError,
+        backgroundChange);
+    if (background == 1) {
+        const wchar_t* suffix = backgroundChange == HookBridge::BackgroundChange::CallbackCreated
+            ? L" 子程序已创建"
+            : backgroundChange == HookBridge::BackgroundChange::SubscriptionRepaired
+                ? L" 订阅已补齐" : L" 子程序已就绪";
+        return {true, "create_background", "已在后台创建或补齐 " + assemblyUtf8 + " → " + handlerUtf8 + "，已确认订阅，保持网页预览",
+            handler + suffix};
+    }
+    if (background != 2) {
+        return Fail("create_background", "后台创建未完成，未改用跳转创建：" + backgroundError);
+    }
+    // The background model has already serialized and verified the complete
+    // callback and its subscription before returning 2. The old path treated
+    // that result as permission to re-read the visible page and repair the
+    // body; on a folded or stale page read it saw msg/return as absent and
+    // appended a second pair. Keep the later jump path, but never repair a
+    // callback that the model has proved complete.
+    const bool backgroundAlreadyComplete = background == 2;
+
+    // A closed code page is not evidence that its assembly was deleted.
+    auto subscriptionAssembly = LookupAssemblyPage(mainWindow, mdiClient, kSubscribeAssembly);
+    if (subscriptionAssembly.state != ProjectAssembly::State::Absent &&
+        (subscriptionAssembly.state != ProjectAssembly::State::Found ||
+         !subscriptionAssembly.document)) {
+        return Fail("subscribe", AssemblyLookupFailure(subscriptionAssembly, kSubscribeAssembly));
+    }
+    bool memoryAssemblyCreated = false;
+    if (subscriptionAssembly.state == ProjectAssembly::State::Absent) {
+        std::string hookError;
+        memoryAssemblyCreated = HookBridge::GenerateAssembly(
+            WideToAnsi(kSubscribeAssembly), channelAnsi, handlerAnsi, hookError);
+        DesignerLog::Write(
+            "HYBRID memory_generate success=" + std::to_string(memoryAssemblyCreated ? 1 : 0) +
             " error=\"" + hookError + "\"");
-        if (generated) {
-            PumpMessagesFor(200);
-            return {
-                true,
-                "hook_create",
-                "Hook 已生成程序集 " + assemblyUtf8 + " → " + handlerUtf8};
+        PumpMessagesFor(250);
+        subscriptionAssembly = LookupAssemblyPage(mainWindow, mdiClient, kSubscribeAssembly);
+        if (subscriptionAssembly.state != ProjectAssembly::State::Found ||
+            !subscriptionAssembly.document) {
+            return Fail("subscribe", "创建后未确认唯一的订阅程序集，已停止后续写入：" +
+                hookError + " " + subscriptionAssembly.reason);
         }
     }
 
-    // Create the fixed subscription routine first. This keeps it at the top
-    // of a fresh assembly, before callback subroutines are added.
-    const PageEnsureResult hookPage = EnsureAssemblySubPage(
-        mainWindow, mdiClient, std::wstring(kSubscribeAssembly), std::wstring(kSubscribeSub));
-    if (!hookPage.ok) {
-        return Fail("subscribe", "固定子程序准备失败：" + hookPage.message);
-    }
-    PageEnsureResult result;
-    if (_wcsicmp(assembly.c_str(), kSubscribeAssembly) == 0) {
-        const PageScanResult callbackExists = ScanPageForType(VT_SUB_NAME, handlerAnsi, false);
-        if (callbackExists.matchRow >= 0) {
-            result.ok = true;
-            result.document = hookPage.document;
-            result.subRow = callbackExists.matchRow;
+    const std::string fastJumpKey =
+        assemblyAnsi + "\x1f" + handlerAnsi + "\x1f" + channelAnsi;
+    if (assembly == kSubscribeAssembly &&
+        g_fastJumpKeys.find(fastJumpKey) != g_fastJumpKeys.end()) {
+        HWND existingPage = FindMdiDocument(mdiClient, assembly);
+        std::string currentPage;
+        if (existingPage != nullptr && ActivateDocument(mdiClient, existingPage) &&
+            ReadPageCodeUtf8(currentPage) &&
+            CountSubInPage(ParsePageCode(currentPage), handlerUtf8) == 1 &&
+            CountSubInPage(ParsePageCode(currentPage), WideToUtf8(kSubscribeSub)) == 1 &&
+            PageTextHasSubscription(currentPage, WideToUtf8(kSubscribeSub), channelUtf8, handlerUtf8)) {
+            PageScanResult located = ScanPageForType(VT_SUB_NAME, handlerAnsi, false);
+            if (located.matchRow < 0) {
+                // The grid knows only the rows near the caret, so a handler that
+                // was written earlier and then left behind by later clicks reads
+                // as absent here. Falling through on that answer sent a page whose
+                // code was already complete into the full create/repair path,
+                // where two lookups walked the caret over the whole document
+                // before concluding the same. One page render settles it.
+                const int row = ResolveRowFromPageText(currentPage, handlerAnsi, handlerUtf8);
+                if (row >= 0) {
+                    located.matchRow = row;
+                    located.matchColumn = 0;
+                }
+            }
+            if (located.matchRow >= 0 &&
+                JumpToLocatedSubroutine(handlerAnsi, located.matchRow, located.matchColumn)) {
+                DesignerLog::Write(
+                    "UI_EVENT routed action=fast_jump handler=\"" + handlerUtf8 +
+                    "\" assembly=\"" + assemblyUtf8 +
+                    "\" channel=\"" + channelUtf8 + "\"");
+                return {
+                    true,
+                    "jump",
+                    "jumped to " + assemblyUtf8 + " -> " + handlerUtf8};
+            }
         }
-        else {
-            ActivateDocument(mdiClient, hookPage.document);
-            InvokeIde(FN_MOVE_BOTTOM, 0, 0);
-            const std::string callbackText =
-                WideToAnsi(L".子程序 ") + handlerAnsi + WideToAnsi(L", 整数型\r\n") +
-                WideToAnsi(L".参数 WinId, 整数型\r\n") +
-                WideToAnsi(L".参数 msg, 文本型\r\n\r\n") +
-                WideToAnsi(L"msg ＝ UTF8文本到GBK文本 (msg)\r\n") +
-                WideToAnsi(L"返回 (JadeView.文本.创建指针 (\"ok\"))\r\n");
-            std::string hookError;
-            const bool inserted = HookBridge::InsertAnsi(callbackText, hookError);
-            PumpMessagesFor(120);
-            const PageScanResult callback = ScanPageForType(VT_SUB_NAME, handlerAnsi, false);
-            // The native paste routine has already parsed and committed the
-            // callback. A long page may hide the newly inserted row from the
-            // public grid reader, so do not turn a successful native commit
-            // into a false failure just because immediate rediscovery missed it.
-            result.ok = inserted;
-            result.document = hookPage.document;
-            result.subRow = callback.matchRow;
+        // A stale session key must not hide a missing callback. Fall through
+        // once to the existing repair/create path, then relearn the key.
+        g_fastJumpKeys.erase(fastJumpKey);
+        DesignerLog::Write(
+            "UI_EVENT fast_jump fallback handler=\"" + handlerUtf8 +
+            "\" assembly=\"" + assemblyUtf8 + "\"");
+    }
+
+    // The subscribe assembly is the hybrid bridge's own page. Do not call the
+    // public FN_INSERT_NEW_SUB path here: it was the source of the
+    // "native_only" log and made this version look like the normal build. Create
+    // or repair the fixed routine through the private text paste bridge instead.
+    PageEnsureResult hookPage;
+    hookPage.document = FindMdiDocument(mdiClient, std::wstring(kSubscribeAssembly));
+    hookPage.createdAssembly = memoryAssemblyCreated;
+    if (hookPage.document == nullptr) {
+        return Fail(
+            "subscribe",
+            memoryAssemblyCreated
+                ? "内存桥接报告程序集已创建，但其代码页未出现"
+                : "未找到通讯订阅程序集代码页，且内存桥接创建失败（请检查 jadehook.dll）");
+    }
+    if (!ActivateDocument(mdiClient, hookPage.document)) {
+        return Fail("subscribe", "无法激活通讯订阅程序集代码页");
+    }
+    const std::string subscribeSubAnsi = WideToAnsi(kSubscribeSub);
+    // Source text of the subscription assembly page, rendered once for this
+    // event. It answers both "is the fixed routine already here" and "is this
+    // subscription line already here", and it is the only view of the page that
+    // does not stop at the rows the grid has materialised.
+    std::string subscribePageTextUtf8;
+    if (!ReadPageCodeUtf8(subscribePageTextUtf8)) {
+        return Fail("subscribe", "订阅程序集代码页读取失败，已停止写入");
+    }
+    const PageCodeInfo subscriptionPage = ParsePageCode(subscribePageTextUtf8);
+    if (!subscriptionPage.valid ||
+        Utf8ToWide(subscriptionPage.assemblyUtf8) != kSubscribeAssembly) {
+        return Fail("subscribe", "活动代码页不是目标订阅程序集，已停止写入");
+    }
+    if (CountSubInPage(subscriptionPage, WideToUtf8(kSubscribeSub)) > 1 ||
+        (assembly == kSubscribeAssembly && CountSubInPage(subscriptionPage, handlerUtf8) > 1)) {
+        return Fail("subscribe", "订阅程序集内存在同名子程序，已停止写入，请先检查重复项");
+    }
+    PageScanResult fixedSub = ScanPageForType(VT_SUB_NAME, subscribeSubAnsi, false);
+    bool fixedSubExists = fixedSub.matchRow >= 0;
+    if (!fixedSubExists) {
+        // The fixed routine sits in the first rows of the page, and those rows
+        // read back empty while the editor window is parked further down. Taking
+        // that for absence appends a second .子程序 Jade_通讯_订阅, after which
+        // every later click has two candidate homes for its subscription line
+        // and picks whichever one it happens to see. A row the grid returns is
+        // proof; a missing row only means ask the page source.
+        const SubLookupResult fixedLookup = LookupSubroutine(
+            mdiClient, hookPage.document, subscribeSubAnsi, subscribePageTextUtf8);
+        if (subscribePageTextUtf8.empty()) {
+            subscribePageTextUtf8 = fixedLookup.pageTextUtf8;
+        }
+        if (fixedLookup.state == SubLookupState::Unreadable) {
+            return Fail(
+                "subscribe",
+                "代码页读取失败，已放弃写入以免重复插入固定子程序（请重试或检查 jadehook.dll）");
+        }
+        // FoundTextOnly counts as existing even though it carries no row: the
+        // subscription write below re-locates the row for itself, while creating
+        // again could never be undone.
+        fixedSubExists = fixedLookup.state != SubLookupState::ConfirmedAbsent;
+        fixedSub.matchRow = fixedLookup.row;
+    }
+    // Writing it is deferred until the callback below has also been decided, so
+    // that both missing blocks travel in one package. Creating the fixed routine
+    // on its own leaves the page ending in a subroutine that has neither
+    // parameters nor a body, and a .子程序 paste into that tail is accepted by
+    // the paste dispatcher yet never appears on the page - which is how a click
+    // could finish with nothing but the assembly and an empty Jade_通讯_订阅.
+    const std::string fixedSubText =
+        fixedSubExists
+            ? std::string()
+            : WideToAnsi(L".子程序 ") + subscribeSubAnsi + WideToAnsi(L"\r\n");
+    // For callbacks in the subscription assembly, use the memory bridge to
+    // insert the complete callback block.  The bridge is called only after the
+    // queued UI event reaches the native window procedure, not from the
+    // WebView2 callback itself.  Never follow a successful insert with a public
+    // create attempt merely because the index has not caught up yet.
+    PageEnsureResult result;
+    // Source text of the page the callback itself lives on. Same page as
+    // subscribePageTextUtf8 for callbacks in the subscription assembly, a
+    // different one for the shared-assembly path below, so the two must not be
+    // conflated: the callback body would then be checked against a page that
+    // never contained it.
+    std::string pageTextUtf8;
+    // Set only when the hook pasted the whole .子程序/.参数/函数体 block during
+    // this event. That text went through the IDE's own parser, so the body is
+    // complete by construction and must not be re-derived from a page read.
+    bool hookWroteFullBlock = backgroundAlreadyComplete;
+    const bool callbackInSubscribeAssembly =
+        _wcsicmp(assembly.c_str(), kSubscribeAssembly) == 0;
+    // A plain grid scan reports a callback the IDE has not materialised as
+    // absent, and pasting on that answer appends a second copy of the whole
+    // block. Ask the page source instead, and treat "cannot read" as its own
+    // answer rather than as absence.
+    SubLookupResult callbackLookup;
+    if (callbackInSubscribeAssembly) {
+        callbackLookup = LookupSubroutine(
+            mdiClient, hookPage.document, handlerAnsi, subscribePageTextUtf8);
+        pageTextUtf8 = callbackLookup.pageTextUtf8;
+        // Same page here, so a render the callback lookup had to do covers the
+        // subscription check below as well.
+        subscribePageTextUtf8 = pageTextUtf8;
+        if (callbackLookup.state == SubLookupState::Unreadable) {
+            return Fail(
+                "subscribe",
+                "代码页读取失败，已放弃写入以免重复插入回调（请重试或检查 jadehook.dll）");
+        }
+    }
+    const bool callbackExists =
+        callbackLookup.state == SubLookupState::Found ||
+        callbackLookup.state == SubLookupState::FoundTextOnly;
+    const std::string fullCallbackText =
+                  WideToAnsi(L".子程序 ") + handlerAnsi + WideToAnsi(L", 整数型\r\n") +
+                  WideToAnsi(L".参数 WinId, 整数型\r\n") +
+                  WideToAnsi(L".参数 msg, 文本型\r\n\r\n") +
+                  WideToAnsi(L"msg ＝ UTF8文本到GBK文本 (msg)\r\n") +
+                  WideToAnsi(L"返回 (JadeView.文本.创建指针 (\"ok\"))\r\n");
+    const std::string callbackText =
+        (!callbackInSubscribeAssembly || callbackExists) ? std::string() : fullCallbackText;
+    // Wire the control into Jade_通讯_订阅集.Jade_通讯_订阅.
+    const std::string statementText =
+        WideToAnsi(L"JadeView.通讯.订阅 (\"") + channelAnsi +
+        WideToAnsi(L"\", &") + handlerAnsi + ")\r\n";
+    // Whatever the subscription page is missing goes in as one package, pasted
+    // at the tail of a page that still ends in .程序集 or in a subroutine body -
+    // never at the tail of the empty subroutine a two-step write would have just
+    // created there.
+    // The subscription line rides along whenever the fixed routine is created
+    // here, because the caret append below needs a statement row to aim at and a
+    // body that was just created has none: the paste is accepted and the line
+    // never appears. As source text the IDE's own parser places it correctly.
+    const std::string pendingText =
+        fixedSubText.empty() ? callbackText
+                             : fixedSubText + statementText + callbackText;
+    if (!pendingText.empty()) {
+        ActivateDocument(mdiClient, hookPage.document);
+        InvokeIde(FN_MOVE_BOTTOM, 0, 0);
+        std::string hookError;
+        const bool inserted = HookBridge::InsertAnsi(pendingText, hookError);
+        PumpMessagesFor(180);
+        // One render of the page answers for both blocks, so a click that has to
+        // build the assembly from scratch still reads the page only once here.
+        std::string writtenPageTextUtf8;
+        if (!fixedSubText.empty()) {
+            const MemoryWriteCheck fixedWritten = ConfirmMemoryWrite(subscribeSubAnsi);
+            writtenPageTextUtf8 = fixedWritten.pageTextUtf8;
             DesignerLog::Write(
-                "HYBRID callback_hook success=" + std::to_string(result.ok ? 1 : 0) +
+                "HYBRID memory_fixed_sub success=" + std::to_string(inserted ? 1 : 0) +
+                " confirmed=" + std::to_string(fixedWritten.present ? 1 : 0) +
+                " row=" + std::to_string(fixedWritten.row) +
+                " error=\"" + hookError + "\"");
+            if (!inserted || !fixedWritten.present) {
+                return Fail("subscribe", hookError.empty()
+                    ? "内存桥接未确认固定子程序已写入"
+                    : "固定子程序内存写入失败：" + hookError);
+            }
+            fixedSub.matchRow = fixedWritten.row;
+            hookPage.createdSubroutine = true;
+        }
+        if (!callbackText.empty()) {
+            const MemoryWriteCheck callbackWritten =
+                ConfirmMemoryWrite(handlerAnsi, writtenPageTextUtf8);
+            writtenPageTextUtf8 = callbackWritten.pageTextUtf8;
+            // A TRUE return only means the private paste dispatcher ran. The
+            // write is accepted only once the page's own text carries the named
+            // subroutine; otherwise the text was rejected or decoded incorrectly,
+            // and reporting it as written would leave a callback with no
+            // parameters and no body behind.
+            result.ok = inserted && callbackWritten.present;
+            result.subRow = callbackWritten.row;
+            result.createdSubroutine = inserted;
+            result.message = (inserted && !callbackWritten.present && hookError.empty())
+                ? std::string(
+                      "回调子程序粘贴后未出现在代码页，已放弃写入参数与代码（请重试）")
+                : hookError;
+            hookWroteFullBlock = result.ok;
+            DesignerLog::Write(
+                "HYBRID memory_callback success=" + std::to_string(inserted ? 1 : 0) +
+                " confirmed=" + std::to_string(result.ok ? 1 : 0) +
+                " row=" + std::to_string(callbackWritten.row) +
                 " error=\"" + hookError + "\"");
         }
+        if (!writtenPageTextUtf8.empty()) {
+            subscribePageTextUtf8 = writtenPageTextUtf8;
+            // Only the same page may be handed on as the callback's own text.
+            // For a callback in another assembly this render describes the
+            // subscription page instead, and the body check below would then be
+            // made against a page that never contained the callback.
+            if (callbackInSubscribeAssembly) {
+                pageTextUtf8 = writtenPageTextUtf8;
+            }
+        }
+    }
+    if (!callbackInSubscribeAssembly) {
+        result = EnsureAssemblySubPage(mainWindow, mdiClient, assembly, handler, fullCallbackText);
+        hookWroteFullBlock = result.ok && result.createdSubroutine;
     }
     else {
-        result = EnsureAssemblySubPage(mainWindow, mdiClient, assembly, handler);
+        result.document = hookPage.document;
+        if (callbackText.empty()) {
+            // Already there; the lookup above is the proof.
+            result.ok = true;
+            result.subRow = callbackLookup.row;
+        }
     }
+    // The fixed routine's row is the append point for the subscription line
+    // below, and the only fallback when the scan there comes back empty.
+    hookPage.subRow = fixedSub.matchRow;
+    hookPage.ok = hookPage.subRow >= 0;
     if (!result.ok) {
-        return Fail(result.createdAssembly ? "create_assembly" : "create_sub", result.message);
+        return Fail(result.createdAssembly ? "create_assembly" : "create_sub",
+            result.message.empty() ? "memory bridge callback insertion failed" : result.message);
+    }
+    // An existing callback in another assembly needs its own source before any
+    // signature/body repair. A failed read must stop this event, not just skip
+    // body checks while still modifying parameters or the subscription page.
+    if (pageTextUtf8.empty() && !hookWroteFullBlock) {
+        if (result.document != nullptr && IsWindow(result.document)) {
+            ActivateDocument(mdiClient, result.document);
+        }
+        if (!ReadPageCodeUtf8(pageTextUtf8) || !ParsePageCode(pageTextUtf8).valid) {
+            return Fail("subscribe", "回调程序集代码页读取失败，已停止写入");
+        }
     }
     // Give the callback its production signature (WinId/msg 参数、UTF-8 提醒、
     // 返回响应指针与整数型返回值) — mirrors ipc_获取二维码 in the reference
     // project; no-op when the signature already exists.
-    SetupSubscribeCallbackBody(mainWindow, mdiClient, result.document, handler, result.subRow);
+    SetupSubscribeCallbackBody(
+        mainWindow, mdiClient, result.document, handler, result.subRow,
+        hookWroteFullBlock, pageTextUtf8);
 
-    // Wire the control into Jade_通讯_订阅集.Jade_通讯_订阅.
-    const std::string subscribeSubAnsi = WideToAnsi(kSubscribeSub);
-    const std::string statementText =
-        WideToAnsi(L"JadeView.通讯.订阅 (\"") + channelAnsi +
-        WideToAnsi(L"\", &") + handlerAnsi + ")\r\n";
     const std::string detectToken =
         WideToAnsi(L"JadeView.通讯.订阅(\"") + channelAnsi + "\"";
-    const std::string compactDetectToken = CompactStatement(detectToken);
-    // Parameter page replacement can shift every following physical row.
-    // Re-locate the fixed subscription routine immediately before writing it.
-    PageEnsureResult currentHookPage = hookPage;
-    const PageScanResult refreshedHook =
-        ScanPageForType(VT_SUB_NAME, subscribeSubAnsi, false);
-    if (refreshedHook.matchRow >= 0) {
-        currentHookPage.subRow = refreshedHook.matchRow;
-    }
     bool hookAppended = false;
-    const StatementArea hookArea = ScanSubStatementArea(currentHookPage.subRow);
-    bool hookAlreadyPresent = false;
-    for (const auto& entry : hookArea.lines) {
-        if (entry.second.find(compactDetectToken) != std::string::npos) {
-            hookAlreadyPresent = true;
-            break;
-        }
-    }
-    if (!hookAlreadyPresent) {
-        ActivateDocument(mdiClient, currentHookPage.document);
-        int appendRow = currentHookPage.subRow + 1;
-        if (hookArea.lastRow >= appendRow) {
-            appendRow = hookArea.lastRow;
-            CellText lastCell{};
-            if (ReadCell(appendRow, 0, lastCell) && !lastCell.text.empty()) {
-                InvokeIde(FN_MOVE_CARET, static_cast<DWORD>(appendRow), 0);
-                InvokeIde(FN_INSERT_NEW_AT_NEXT, 0, 0);
-                PumpMessagesFor(80);
-                ++appendRow;
-            }
-        }
-        InvokeIde(FN_MOVE_CARET, static_cast<DWORD>(appendRow), 0);
-        InvokeIde(FN_MOVE_EDIT_CARET_TO_END, 0, 0);
-        std::string hookError;
-        hookAppended = HookBridge::InsertAnsi(statementText, hookError);
+    // The common case is a button that is already wired up. The page source
+    // says so without touching the editor, while the grid path below has to
+    // scroll to the top of the document and back - which is the caret wandering
+    // the user sees before an ordinary jump lands. It is also the only source
+    // that can see the fixed routine on a page taller than the editor, and the
+    // grid answering "absent" there is what appended a second identical
+    // subscription line.
+    if (PageTextHasSubscription(
+            subscribePageTextUtf8, WideToUtf8(kSubscribeSub), channelUtf8, handlerUtf8)) {
         DesignerLog::Write(
-            "HYBRID subscription_hook success=" + std::to_string(hookAppended ? 1 : 0) +
-            " error=\"" + hookError + "\"");
-    }
-    else {
+            "HYBRID subscription_present_from_page_text channel=\"" + channelUtf8 + "\"");
         hookAppended = true;
     }
+    else {
+        // Parameter page replacement can shift every following physical row.
+        // Re-locate the fixed subscription routine immediately before writing
+        // it. Scroll to the top first: the fixed routine sits in the first rows,
+        // and on a page taller than the editor those rows are only readable
+        // while the window is actually over them.
+        if (!ActivateDocument(mdiClient, hookPage.document)) {
+            return Fail("subscribe", "无法切回订阅程序集，已停止写入");
+        }
+        InvokeIde(FN_MOVE_TOP, 0, 0);
+        PumpMessagesFor(60);
+        PageEnsureResult currentHookPage = hookPage;
+        const PageScanResult refreshedHook =
+            ScanPageForType(VT_SUB_NAME, subscribeSubAnsi, false);
+        if (refreshedHook.matchRow >= 0) {
+            currentHookPage.subRow = refreshedHook.matchRow;
+        }
+        if (currentHookPage.subRow < 0) {
+            // The routine exists - the page text said so - but neither source
+            // will say which row it occupies, and row 0 is the assembly header,
+            // not an append point.
+            return Fail(
+                "subscribe",
+                "无法定位固定子程序所在行，已放弃写入订阅行以免插到错误位置（请重试）");
+        }
+        const StatementArea hookArea = ScanSubStatementArea(currentHookPage.subRow);
+        bool hookAlreadyPresent = false;
+        bool hookMatchKept = false;
+        for (const auto& entry : hookArea.lines) {
+            if (IsSubscriptionStatement(entry.second, channelAnsi, handlerAnsi)) {
+                if (hookMatchKept) {
+                    RenameCellAt(entry.first, 0, std::string());
+                    DesignerLog::Write(
+                        "HYBRID subscription_duplicate_removed row=" +
+                        std::to_string(entry.first));
+                }
+                else {
+                    hookAlreadyPresent = true;
+                    hookMatchKept = true;
+                }
+            }
+        }
+        if (!hookAlreadyPresent) {
+            ActivateDocument(mdiClient, currentHookPage.document);
+            // 注册事件 has always written its line through this helper, and a
+            // subscription line is the same kind of write. The hand-rolled
+            // append that used to stand here aimed the caret at
+            // hookArea.lastRow - the body's trailing structural row, which
+            // ScanSubStatementArea counts because some cell there carries data
+            // even though its statement cell is empty. Both of that row's
+            // consequences were missed: the "open a fresh row first" step was
+            // skipped because the cell read back empty, and e5.95 clamps a
+            // caret aimed at a blank statement row back onto the previous
+            // content row. The paste landed on neither row and was dropped.
+            // The helper targets that blank row on purpose, recovers from the
+            // clamp with FN_MOVE_DOWN, and writes through the editor's own
+            // parser instead of the paste dispatcher.
+            const bool appended = AppendStatementsIfMissing(
+                mdiClient,
+                currentHookPage.document,
+                subscribeSubAnsi,
+                statementText,
+                detectToken,
+                currentHookPage.subRow);
+            // The helper confirms against the grid, which e5.95 rebuilds
+            // lazily, so its FALSE is not proof that nothing was written. The
+            // page's own source is proof, and it is the same view the fast path
+            // above trusts.
+            PumpMessagesFor(120);
+            bool subscriptionConfirmed = false;
+            std::string verifyPageTextUtf8;
+            if (ReadPageCodeUtf8(verifyPageTextUtf8)) {
+                subscriptionConfirmed = PageTextHasSubscription(
+                    verifyPageTextUtf8, WideToUtf8(kSubscribeSub), channelUtf8,
+                    handlerUtf8);
+                subscribePageTextUtf8 = verifyPageTextUtf8;
+            }
+            DesignerLog::Write(
+                "HYBRID memory_subscription appended=" + std::to_string(appended ? 1 : 0) +
+                " confirmed=" + std::to_string(subscriptionConfirmed ? 1 : 0) +
+                " sub_row=" + std::to_string(currentHookPage.subRow) +
+                " area_last_row=" + std::to_string(hookArea.lastRow) +
+                " area_lines=" + std::to_string(static_cast<int>(hookArea.lines.size())));
+            if (!subscriptionConfirmed) {
+                return Fail(
+                    "subscribe",
+                    "订阅行未出现在 Jade_通讯_订阅 中（请重试）");
+            }
+            hookAppended = true;
+        }
+        else {
+            hookAppended = true;
+        }
+    }
 
-    const bool jumped = JumpToSubroutine(handlerAnsi);
+    if (!ActivateDocument(mdiClient, result.document)) {
+        return Fail("jump", "订阅已处理，但无法切回回调程序集");
+    }
+    const bool jumped = JumpToSubroutine(
+        handlerAnsi,
+        result.subRow,
+        callbackInSubscribeAssembly ? subscribePageTextUtf8 : pageTextUtf8);
+    if (jumped || result.ok) {
+        // The callback/subscription are now known to exist for this session;
+        // future clicks can use the no-edit fast path above.
+        g_fastJumpKeys.insert(fastJumpKey);
+    }
     DesignerLog::Write(
         "UI_EVENT routed action=" + std::string(result.createdAssembly ? "create_assembly"
             : result.createdSubroutine ? "create_sub" : "jump") +

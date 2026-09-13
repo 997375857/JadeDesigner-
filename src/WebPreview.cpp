@@ -2,6 +2,16 @@
 
 #include "DesignerLog.h"
 #include "IdeEventRouter.h"
+#include "ProjectAssembly.h"
+#include "DesignerText.h"
+#include "DesignerVisual.h"
+#include "NativeToolbox.h"
+#include "NativeDiagnosticsDock.h"
+#include "HookBridge.h"
+#include "DesignerInspection.h"
+#include "DesignerToolsScript.h"
+#include "RuntimeDiagnosticsScript.h"
+#include "DiagnosticsInstall.h"
 
 #include <CommCtrl.h>
 #include <Shlwapi.h>
@@ -12,7 +22,10 @@
 #include <cwchar>
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <iterator>
+#include <memory>
+#include <new>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -28,6 +41,12 @@ constexpr wchar_t kTabText[] = L"Jade预览";
 constexpr UINT_PTR kRefreshTimerId = 0x4A44;
 constexpr UINT kRefreshIntervalMs = 600;
 constexpr UINT kMaximizeDocumentMessage = WM_APP + 0x4A4;
+// WebView2 invokes WebMessageReceived while its controller is still inside
+// the browser callback. Editing/activating an e5.95 MDI page from that callback
+// can re-enter the preview and crash the IDE. Queue the event to the native
+// preview window and handle it after the WebView callback returns.
+constexpr UINT kRouteUiEventMessage = WM_APP + 0x4A5;
+constexpr UINT kNativeToolboxMessage = WM_APP + 0x4A6;
 
 struct PreviewState {
     HMODULE module = nullptr;
@@ -58,6 +77,9 @@ struct PreviewState {
     ComPtr<ICoreWebView2> webView;
     EventRegistrationToken navigationToken{};
     bool navigationTokenValid = false;
+    EventRegistrationToken navigationStartingToken{};
+    bool navigationStartingTokenValid = false;
+    unsigned long long documentGeneration = 0;
     EventRegistrationToken webMessageToken{};
     bool webMessageTokenValid = false;
     unsigned long long generation = 0;
@@ -65,6 +87,23 @@ struct PreviewState {
 };
 
 PreviewState g_state;
+NativeToolbox g_nativeToolbox;
+NativeDiagnosticsDock g_nativeDiagnostics;
+bool g_visualDesignMode = false;
+
+struct PendingUiEvent {
+    unsigned long long generation = 0;
+    unsigned long long documentGeneration = 0;
+    IdeEventRouter::UiEvent event;
+    bool commonCommand = false;
+    CommonCode::Options commonOptions;
+    std::wstring toolMessage, projectPath, indexPath, traceId;
+};
+
+DesignerText::Document g_textDocument;
+IdeEventRouter::CommonPreview g_commonPreview;
+unsigned g_commonPreviewRevision = 0;
+std::wstring g_commonPreviewProject;
 
 int MeasureTextWidth(HDC dc, const wchar_t* text, int length)
 {
@@ -509,6 +548,10 @@ bool ReadRecentProjectPath(std::wstring& projectPath)
         return false; // no project loaded in this instance
     }
     if (ExtractProjectPathFromTitle(title, projectPath)) {
+        // Polled every 600 ms while the preview is open, so this is the earliest
+        // and most reliable point at which the log can learn where the source
+        // being worked on lives - no click required.
+        DesignerLog::UseProjectFile(projectPath);
         return true;
     }
     static bool loggedTitleMiss = false;
@@ -865,20 +908,52 @@ void InstallUiEventBridge()
     if (!g_state.webView) {
         return;
     }
-    constexpr const wchar_t* script = LR"JS(
+    const std::wstring script = LR"JS(
 (() => {
   if (window.__jadeDesignerEventBridgeInstalled) return 'already-installed';
   window.__jadeDesignerEventBridgeInstalled = true;
   const encode = value => encodeURIComponent(String(value ?? ''));
+  window.__jadeDesignerPreview = true;
+  let toolsObserve = (element,wire) => wire;
+  let toolsIgnored = () => {};
+  // Icon-only buttons (<button onclick="closeWindow()"><i class="fa fa-times"></i></button>)
+  // have no id, no name and no text, so there is nothing stable to name a
+  // subroutine after - except the function their inline handler calls, which is
+  // exactly as stable as an id and already says what the button does.
+  const inlineHandlerName = element => {
+    for (const attribute of ['onclick', 'onchange', 'oninput']) {
+      const source = element.getAttribute(attribute);
+      if (!source) continue;
+      const match = /([A-Za-z_$][\w$]*)\s*\(/.exec(source);
+      if (match) return match[1];
+    }
+    return '';
+  };
+  const stableName = element => element.dataset.jadeName || element.id || element.name ||
+    element.getAttribute('aria-label') || element.title || inlineHandlerName(element);
   const readableName = element => {
-    const explicitName = element.dataset.jadeName || element.id || element.name ||
-      element.getAttribute('aria-label') || element.title;
+    const explicitName = stableName(element);
     if (explicitName) return explicitName;
     const text = (element.textContent || element.value || element.tagName || 'Jade控件').trim();
     return text.slice(0, 60) || 'Jade控件';
   };
-  const hasReadableName = element => !!(element.dataset.jadeName || element.id ||
-    element.name || element.getAttribute('aria-label') || element.title);
+  const hasReadableName = element => !!stableName(element);
+  // Window chrome and modal-dismiss controls are UI plumbing, not business
+  // controls. Do not turn them into Jade callback subroutines even when they
+  // have an id or an inline handler such as closeQrModal().
+  const isWindowControl = element => {
+    if (element.closest('.window-controls')) return true;
+    const className = typeof element.className === 'string' ? element.className : '';
+    const classTokens = className.split(/\s+/).filter(Boolean);
+    if (classTokens.some(token =>
+      /^(?:close|dismiss|minimize|maximize)(?:-(?:btn|button|modal|dialog|window|control))?$/i.test(token) ||
+      /^(?:modal|dialog|browser|window)-(?:close|dismiss)$/i.test(token) ||
+      /^browser-card-close$/i.test(token))) {
+      return true;
+    }
+    const identity = `${element.id || ''} ${inlineHandlerName(element)}`.toLowerCase();
+    return /(?:^|[\s_-])(close|hide|dismiss|minimize|maximize)(?=[\w-]*?(?:window|modal|dialog|browser|qr))/i.test(identity);
+  };
   // Preview environment has no real JadeView jade object; install a stub that
   // records the channel of every jade.invoke call. Page handlers run after our
   // capture listener, so the latest channel is known by the time we emit.
@@ -894,9 +969,61 @@ void InstallUiEventBridge()
       off: (eventName) => { delete listeners[eventName]; },
     };
   }
-  const emit = (domEvent, element, eventName, controlType) => {
+  // JadeView normally provides a real jade.invoke. The preview stub above is
+  // the only place that used to populate __jadeLastPayload, so real pages
+  // reached the native dock with an empty JSON column. Wrap the real method
+  // transparently: preserve its receiver, arguments, return value and errors,
+  // while remembering the exact payload for the current DOM event.
+  const captureJadeInvoke = () => {
+    const api = window.jade;
+    if (!api || typeof api.invoke !== 'function' || api.invoke.__jadeDesignerCapture)
+      return;
+    const original = api.invoke;
+    const captured = function (...args) {
+      window.__jadeLastChannel = String(args[0] || '');
+      window.__jadeLastPayload = args.length > 1 ? args[1] : undefined;
+      return original.apply(this, args);
+    };
+    try {
+      Object.defineProperty(captured, '__jadeDesignerCapture', { value: true });
+      api.invoke = captured;
+    } catch (error) {
+      // A host may expose a non-writable invoke property. The event bridge
+      // still reports the callback; it simply cannot recover that payload.
+    }
+  };
+  captureJadeInvoke();
+  // A dialog's dismiss button is plumbing, not a business control, but the ones
+  // wired up with addEventListener leave nothing behind in the DOM for
+  // isWindowControl to match on - btnInfoOk reads exactly like a business
+  // button. What gives them away is the effect of the click: the dialog they
+  // sit in was on screen when they were pressed and is gone once the page
+  // handler has run, and nothing else happened - no channel invoked, no
+  // handler declared. A page normally shares one info box between every
+  // validation failure it can report, so without this rule a single subroutine
+  // ends up standing for a dozen unrelated flows, and one DOM control would
+  // have to answer to more than one callback, which it cannot.
+  const visibleDialogOf = element => {
+    const dialog = element.closest('.modal,[role="dialog"],dialog');
+    return dialog && dialog.getClientRects().length > 0 ? dialog : null;
+  };
+  // A page that does want a callback on such a button says so explicitly with
+  // data-jade-handler or data-jade-channel, and keeps it.
+  const dismissedDialog = (element, dialog, captured) => {
+    if (!dialog || captured) return false;
+    const data = element.dataset;
+    if (data.jadeHandler || data.jadeChannel || data.jadeEvent || data.jadeCall) return false;
+    return dialog.getClientRects().length === 0;
+  };
+  const emit = (domEvent, element, eventName, controlType, dialog) => {
     const elementId = readableName(element);
     const captured = (window.__jadeLastChannel || '').trim();
+    if (dismissedDialog(element, dialog, captured)) {
+      toolsIgnored(element,'dialog_dismiss');
+      window.chrome.webview.postMessage(
+        'JADE_SKIP\t' + [elementId, domEvent, 'dialog_dismiss'].map(encode).join('\t'));
+      return;
+    }
     const callType = element.dataset.jadeCall ||
       (element.dataset.jadeChannel || captured ? 'JadeView.通讯.订阅' : '');
     const callParam = element.dataset.jadeChannel || element.dataset.jadeEvent || captured;
@@ -912,22 +1039,71 @@ void InstallUiEventBridge()
     const checked = element.checked === true ? '1' : '0';
     const fields = [domEvent, controlType, elementId, value, checked, handlerName, assemblyName,
       callType, callParam];
-    window.chrome.webview.postMessage('JADE_EVT\t' + fields.map(encode).join('\t'));
+    let payload = '';
+    try {
+      payload = window.__jadeLastPayload === undefined ? '' : JSON.stringify(window.__jadeLastPayload);
+    } catch (error) {
+      payload = '[参数不可序列化]';
+    }
+    // The native 工作夹 page is the communication inspector. Keep its row
+    // focused on the exact payload the page sent, independently of whether
+    // the generator later creates, locates, or rejects a callback.
+    window.chrome.webview.postMessage(
+      'JADE_DOCK_TRACE\t' + fields.map(encode).join('\t') + '\t' + encode(payload));
+    // 模拟调试只展示“将要交给易语言”的内容，不进入原生事件生成链路。
+    // payload 来自页面本次点击中同步调用的 jade.invoke。
+    // Preview mode is read-only for code generation, but it must still expose
+    // the real page-to-JadeView payload in the native communication dock.
+    // Design mode is selection-only and should not create diagnostic rows.
+    if (window.__jadeInteractionMode === 'preview') {
+      return;
+    }
+    if (window.__jadePreviewDebug) {
+      // 工具栏与事件桥在同一个预览脚本作用域内，直接写入诊断面板，
+      // 不经过原生消息通道，避免再次进入易语言事件生成器。
+      if (typeof toolsPreviewTrace === 'function') {
+        toolsPreviewTrace(fields, payload);
+      }
+      return;
+    }
+    const wire = 'JADE_EVT\t' + fields.map(encode).join('\t');
+    window.chrome.webview.postMessage(toolsObserve(element, wire));
   };
   const scheduleEmit = (domEvent, element, eventName, controlType) => {
     if (!element) return;
     window.__jadeLastChannel = '';
-    setTimeout(() => {
-      const stillThere = element.isConnected || element === document.activeElement;
-      if (stillThere) emit(domEvent, element, eventName, controlType);
-    }, 0);
+    window.__jadeLastPayload = undefined;
+    // Taken here, in the capture phase, because the page's own handler has not
+    // run yet; by the time the queued emit fires a dismiss button has already
+    // closed the dialog and there would be nothing left to compare against.
+    const dialog = visibleDialogOf(element);
+    // Do not cancel a valid control event merely because the control was hidden
+    // or detached by its own click handler (the info/confirm modal does exactly
+    // that). Keep the element reference alive until the queued emit runs so the
+    // native side receives the click and can create/jump to the callback.
+    setTimeout(() => emit(domEvent, element, eventName, controlType, dialog), 0);
   };
   document.addEventListener('click', event => {
+    if (window.__jadeTextEditing || window.__jadeInteractionMode === 'design') return;
     const source = event.target instanceof Element ? event.target : event.target?.parentElement;
     const element = source?.closest('button,[role="button"],input[type="button"],input[type="submit"]');
-    if (element) scheduleEmit('click', element, '被单击', 'button');
+    if (element && !isWindowControl(element)) {
+      // A browser double-click dispatches two click events before dblclick.
+      // The first click is the real Jade event; forwarding the second one
+      // re-enters the native repair path and can append the callback body again.
+      // Leave the page's own click behavior untouched, but do not turn the
+      // second click into another code-generation request.
+      if (event.detail > 1) {
+        toolsIgnored(element,'double_click');
+        return;
+      }
+      scheduleEmit('click', element, '被单击', 'button');
+    } else if(element) {
+      toolsIgnored(element,'window_control');
+    }
   }, true);
   document.addEventListener('change', event => {
+    if (window.__jadeTextEditing || window.__jadeInteractionMode === 'design') return;
     const element = event.target;
     if (!(element instanceof Element)) return;
     if (element.matches('select')) {
@@ -938,16 +1114,345 @@ void InstallUiEventBridge()
       scheduleEmit('change', element, '选中状态被改变', 'checkbox');
     }
   }, true);
+  const commonHost = document.createElement('jade-common-tools');
+  // The compact launcher stays out of the page's left-side controls; opened
+  // tools and diagnostics are docked on the left by their own panel styles.
+  commonHost.style.cssText = 'all:initial;position:fixed;bottom:12px;right:12px;width:40px;height:40px;z-index:2147482999;font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;letter-spacing:0;color:#25332d;';
+  const commonRoot = commonHost.attachShadow({ mode: 'open' });
+  const commonStyle = document.createElement('style');
+  commonStyle.textContent = `
+    :host { font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif;letter-spacing:0;color:#25332d; }
+    button { font:inherit;padding:9px 14px;border:1px solid #9daea5;border-radius:6px;
+      background:#fff;color:inherit;cursor:pointer;box-shadow:0 2px 8px #0002; }
+    button:hover { background:#f0f6f3; } button:disabled { opacity:.6;cursor:wait; }
+    button:focus-visible { outline:2px solid #16784b;outline-offset:2px; }
+    output { display:block;max-width:360px;box-sizing:border-box;margin-bottom:8px;
+      padding:12px;background:#fff;border:1px solid #9daea5;border-radius:6px;overflow-wrap:anywhere; }
+    output:empty { display:none; } output[data-failed] { border-color:#b34e42;color:#8f2920; }
+    fieldset { border:0;margin:0;padding:0;min-width:0; }
+    label { display:flex;align-items:center;gap:8px;margin:8px 0; }
+    input[type=checkbox] { width:17px;height:17px;accent-color:#16784b; }
+    input[type=text] { box-sizing:border-box;width:100%;min-width:0;padding:7px;border:1px solid #9daea5;
+      border-radius:4px;font:inherit;color:inherit;background:#fff; }
+  `;
+  const commonButton = document.createElement('button');
+  commonButton.type = 'button'; commonButton.textContent = '生成公共代码';
+  commonButton.title = '创建 JadeView 基础程序集，保留已有启动入口';
+  const commonStatus = document.createElement('output');
+  commonStatus.setAttribute('role', 'status'); commonStatus.setAttribute('aria-live', 'polite');
+  const commonFields = document.createElement('fieldset');
+  const commonLegend = document.createElement('legend'); commonLegend.textContent = '公共代码设置';
+  commonFields.append(commonLegend);
+  const commonCheck = (name, title) => {
+    const label = document.createElement('label'), input = document.createElement('input');
+    input.type = 'checkbox'; input.name = name; label.append(input, title); commonFields.append(label); return input;
+  };
+  const commonTray = commonCheck('tray', '托盘常驻');
+  commonTray.title = '需要类_json、程序目录 app.ico，以及 JadeView DLL 2.3 或更新';
+  const commonSingle = commonCheck('singleInstance', '单实例');
+  commonSingle.title = '再次启动时恢复已有主窗口；需要 JadeView DLL 2.3 或更新';
+  const commonIdLabel = document.createElement('label'); commonIdLabel.textContent = '应用标识';
+  const commonId = document.createElement('input'); commonId.type = 'text'; commonId.name = 'appId';
+  commonId.id = 'common-app-id'; commonId.maxLength = 64; commonIdLabel.htmlFor = commonId.id;
+  commonId.placeholder = '按当前工程自动生成';
+  commonId.title = '6～64 位英文字母、数字、下划线或短横线。不同软件不要共用标识。';
+  commonFields.append(commonIdLabel, commonId);
+  // A separate command, never a business-control callback. Shadow DOM keeps page
+  // selectors/styles and the document's event-to-code listener out of this tool.
+  commonRoot.append(commonStyle);
+  document.documentElement.append(commonHost);
+)JS" + DesignerToolsScript() + LR"JS(
+  let noticeHost = null;
+  let noticeText = null;
+  let noticeTimer = null;
+  const showCreationNotice = (text, failed = false) => {
+    if (!text) return;
+    if (!noticeHost?.isConnected) {
+      noticeHost = document.createElement('jade-created-notice');
+      noticeHost.style.cssText = 'all:initial;position:fixed;top:16px;right:16px;z-index:2147483000;pointer-events:none;max-width:calc(100vw - 32px);';
+      const root = noticeHost.attachShadow({ mode: 'open' });
+      const style = document.createElement('style');
+      style.textContent = `
+        :host { pointer-events:none; }
+        .notice { display:flex;align-items:flex-start;gap:10px;box-sizing:border-box;
+          max-width:440px;padding:13px 17px;border:1px solid #b4d2c0;border-radius:6px;
+          background:#f3fcf6;color:#195d39;box-shadow:0 4px 18px #123c2422;
+          font:15px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;letter-spacing:0;
+          pointer-events:none;opacity:0;visibility:hidden;transition:opacity 160ms ease; }
+        :host([visible]) .notice { opacity:1;visibility:visible; }
+        :host([data-failed]) .notice { color:#aa382d;background:#fff5f4;border-color:#dab6b1; }
+        .check { flex-shrink:0;font-size:18px;line-height:24px; }
+        .text { min-width:0;overflow-wrap:anywhere; }
+        @media(prefers-reduced-motion:reduce) { .notice { transition:none; } }
+      `;
+      const panel = document.createElement('div');
+      panel.className = 'notice';
+      panel.setAttribute('role', 'status');
+      panel.setAttribute('aria-live', 'polite');
+      panel.setAttribute('aria-atomic', 'true');
+      const check = document.createElement('span');
+      check.className = 'check'; check.textContent = '\u2713'; check.setAttribute('aria-hidden', 'true');
+      noticeText = document.createElement('span'); noticeText.className = 'text';
+      panel.append(check, noticeText); root.append(style, panel);
+      document.documentElement.append(noticeHost);
+    }
+    clearTimeout(noticeTimer);
+    noticeText.textContent = text;
+    noticeHost.toggleAttribute('data-failed', failed);
+    noticeHost.shadowRoot.querySelector('.check').textContent = failed ? '!' : '\u2713';
+    noticeHost.setAttribute('visible', '');
+    noticeTimer = setTimeout(() => noticeHost?.removeAttribute('visible'), failed ? 6000 : 3000);
+  };
   window.chrome.webview.addEventListener('message', event => {
     if (typeof event.data !== 'string') return;
+    if (event.data.startsWith('JADE_TOOL_RESULT\t') || event.data.startsWith('JADE_TRACE_RESULT\t') || event.data.startsWith('JADE_NATIVE_TOOLBOX\t')) return;
+    const commonPrefix = 'JADE_COMMON_RESULT\t';
+    if (event.data.startsWith(commonPrefix)) {
+      const reply = event.data.slice(commonPrefix.length);
+      commonButton.disabled = false; commonButton.textContent = '预览公共代码';
+      commonFields.disabled = false;
+      commonStatus.toggleAttribute('data-failed', !reply.startsWith('1\t'));
+      commonStatus.textContent = reply.slice(2);
+      return;
+    }
+    const noticePrefix = 'JADE_NOTICE\t';
+    if (event.data.startsWith(noticePrefix)) {
+      showCreationNotice(event.data.slice(noticePrefix.length));
+      return;
+    }
     const status = document.querySelector('[data-jade-status]') || document.getElementById('eventLog');
     if (status) status.textContent = event.data;
   });
   return 'installed';
 })()
 )JS";
-    const HRESULT result = g_state.webView->ExecuteScript(script, nullptr);
+    const HRESULT result = g_state.webView->ExecuteScript(script.c_str(), nullptr);
     DesignerLog::Write("PREVIEW install_ui_event_bridge hr=" + HResultText(result));
+}
+
+void InstallRuntimeDiagnostics()
+{
+    if (!g_state.webView) {
+        return;
+    }
+    // Inject the support library's current diagnostics surface after every
+    // navigation. This upgrades an older project-side copy in memory only;
+    // the project's HTML and its managed script file are never rewritten.
+    const std::wstring script = DesignerText::Wide(RuntimeDiagnosticsScript());
+    const HRESULT result = g_state.webView->ExecuteScript(script.c_str(), nullptr);
+    DesignerLog::Write("PREVIEW install_runtime_diagnostics hr=" + HResultText(result));
+}
+
+// The bridge reports the controls it deliberately declined to turn into an
+// event, so that a click which is meant to do nothing can be told apart in the
+// log from one that went missing.
+bool LogIgnoredControl(const std::wstring& wireMessage)
+{
+    constexpr wchar_t kPrefix[] = L"JADE_SKIP\t";
+    constexpr size_t kPrefixLength = (sizeof(kPrefix) / sizeof(wchar_t)) - 1;
+    if (wireMessage.compare(0, kPrefixLength, kPrefix) != 0) {
+        return false;
+    }
+    std::vector<std::string> fields;
+    const std::wstring_view body = std::wstring_view(wireMessage).substr(kPrefixLength);
+    for (size_t start = 0; start <= body.size();) {
+        const size_t separator = body.find(L'\t', start);
+        const size_t stop = separator == std::wstring_view::npos ? body.size() : separator;
+        fields.push_back(IdeEventRouter::DecodeWireField(body.substr(start, stop - start)));
+        if (separator == std::wstring_view::npos) {
+            break;
+        }
+        start = separator + 1;
+    }
+    const auto field = [&fields](size_t index, const char* fallback) {
+        return index < fields.size() && !fields[index].empty() ? fields[index] : fallback;
+    };
+    DesignerLog::Write(
+        "UI_EVENT control_ignored control=\"" + field(0, "?") +
+        "\" dom=" + field(1, "?") + " reason=" + field(2, "unspecified"));
+    return true;
+}
+
+std::wstring ToolEncode(std::string_view text)
+{
+    constexpr wchar_t hex[]=L"0123456789ABCDEF";
+    std::wstring out;
+    for(unsigned char c:text) { out+=L'%'; out+=hex[c>>4]; out+=hex[c&15]; }
+    return out;
+}
+
+// 1: available, 0: taken, -1: unverified. New controls must not silently adopt
+// an orphaned callback or an already wired channel from an older HTML page.
+int VisualNameAvailable(const std::wstring& kind,const std::wstring& number,std::string& error)
+{
+    const auto name=DesignerVisual::RoutineName(kind,number);if(name.empty())return 1;
+    std::string routine,assembly;
+    const auto read=HookBridge::ReadRoutine(WideToAnsi(name.c_str()),routine,error);
+    if(read<0)return -1;if(read>0)return 0;
+    const auto assemblyRead=HookBridge::ReadAssembly(WideToAnsi(L"Jade_通讯_订阅集"),assembly,error);
+    if(assemblyRead<0)return -1;
+    const auto channel=DesignerText::Utf8(L"ui:jade_"+kind+L"_"+number);
+    std::istringstream lines(assembly);std::string line;
+    while(std::getline(lines,line)){std::string candidate,target;if(DesignerInspection::Subscription(line,candidate,target)&&candidate==channel)return 0;}
+    return 1;
+}
+
+void ProcessDesignerTool(const std::wstring& wire)
+{
+    std::vector<std::wstring> fields;
+    size_t p=0;
+    while(p<=wire.size()) {
+        const auto end=wire.find(L'\t',p);
+        fields.push_back(DesignerText::Wide(IdeEventRouter::DecodeWireField(std::wstring_view(wire).substr(p,end==wire.npos?wire.size()-p:end-p))));
+        if(end==wire.npos) break; p=end+1;
+    }
+    if(fields.size()<3 || fields.size()>12) return;
+    const auto id=fields[1], action=fields[2];
+    if(id.empty() || id.size()>16 || id.find_first_not_of(L"0123456789")!=id.npos) return;
+    const auto reply=[&](bool ok,std::initializer_list<std::string> values) {
+        std::wstring out=L"JADE_TOOL_RESULT\t"+id+(ok?L"\t1":L"\t0");
+        for(const auto& value:values) out+=L"\t"+ToolEncode(value);
+        if(g_state.webView) g_state.webView->PostWebMessageAsString(out.c_str());
+    };
+    try {
+        if(action==L"visual_toolbox"&&fields.size()==5) {
+            if((fields[3]!=L"design"&&fields[3]!=L"event"&&fields[3]!=L"preview") ||
+                (fields[4]!=L"1"&&fields[4]!=L"0")){reply(false,{"无效的组件箱设置"});return;}
+            g_visualDesignMode=fields[3]==L"design";
+            std::wstring error;
+            g_nativeToolbox.SetEditable(g_visualDesignMode);
+            const bool ready=g_nativeToolbox.Configure(fields[4]==L"1",WebPreview::IsActive(),error);
+            DesignerLog::Write("PREVIEW native_toolbox enabled="+std::string(fields[4]==L"1"?"1":"0")+" ready="+(ready?"1":"0")+" floating="+(g_nativeToolbox.IsFloating()?"1":"0"));
+            reply(ready,{ready?"组件箱设置已应用":DesignerText::Utf8(error)});
+        } else if(action==L"copy_description"&&fields.size()==4) {
+            const auto& text=fields[3];
+            if(text.empty()||text.size()>32768||text.find(L'\0')!=text.npos){reply(false,{"元素描述过长或内容无效"});return;}
+            HGLOBAL data=GlobalAlloc(GMEM_MOVEABLE,(text.size()+1)*sizeof(wchar_t));
+            auto* buffer=data?static_cast<wchar_t*>(GlobalLock(data)):nullptr;
+            if(!buffer){if(data)GlobalFree(data);reply(false,{"无法分配复制缓冲区"});return;}
+            std::wmemcpy(buffer,text.c_str(),text.size()+1);GlobalUnlock(data);
+            if(!OpenClipboard(g_state.hostWindow)){GlobalFree(data);reply(false,{"剪贴板正忙，请重试复制"});return;}
+            const bool copied=EmptyClipboard()&&SetClipboardData(CF_UNICODETEXT,data);
+            CloseClipboard();if(!copied)GlobalFree(data);
+            reply(copied,{copied?"元素描述已复制":"复制失败，请重试"});
+        } else if(action==L"visual_name"&&fields.size()==5) {
+            if(DesignerVisual::Standard(fields[3],fields[4]).empty()){reply(false,{"无效的控件类型或编号"});return;}
+            auto number=std::stoul(fields[4]);std::string error;
+            if(DesignerVisual::RoutineName(fields[3],fields[4]).empty()){reply(true,{std::to_string(number)});return;}
+            std::string existing;
+            if(HookBridge::ReadAssembly(WideToAnsi(L"Jade_通讯_订阅集"),existing,error)<0){reply(false,{"无法核验已有订阅："+error});return;}
+            std::set<std::string> names,channels;
+            for(const auto& routine:DesignerInspection::Routines(existing))names.insert(routine.name);
+            std::istringstream lines(existing);std::string line;
+            while(std::getline(lines,line)){std::string channel,target;if(DesignerInspection::Subscription(line,channel,target))channels.insert(channel);}
+            int probes=0;
+            for(;number<=999999;++number) {
+                const auto n=std::to_wstring(number),name=DesignerVisual::RoutineName(fields[3],n);
+                if(names.contains(DesignerText::Utf8(name))||channels.contains(DesignerText::Utf8(L"ui:jade_"+fields[3]+L"_"+n)))continue;
+                if(++probes>32)break;
+                std::string routine;
+                const auto found=HookBridge::ReadRoutine(WideToAnsi(name.c_str()),routine,error);
+                if(found<0){reply(false,{"无法核验工程内已有回调，未新增控件："+error});return;}
+                if(found==0){reply(true,{std::to_string(number)});return;}
+            }
+            reply(false,{"连续多个编号已被占用，未新增控件"});
+        } else if(action==L"health" && fields.size()==3) {
+            auto checks=IdeEventRouter::InspectProjectHealth();
+            std::wstring project;
+            if(ReadRecentProjectPath(project)) {
+                const auto directory=DirectoryOf(project);
+                for(const auto* name:{L"web\\index.html",L"jadeview_x86.dll",L"app.ico"}) {
+                    const auto attrs=GetFileAttributesW((directory+L"\\"+name).c_str());
+                    const bool found=attrs!=INVALID_FILE_ATTRIBUTES&&!(attrs&FILE_ATTRIBUTE_DIRECTORY);
+                    checks.push_back({found?"ok":"warning",DesignerText::Utf8(name),found?"工程目录文件存在；版本、内容及实际运行目录未核验":"工程目录未找到；若输出到其他目录请在实际运行目录核对（app.ico 仅托盘需要）"});
+                }
+            } else checks.push_back({"unknown","工程目录","未取得已保存工程路径"});
+            std::string report;
+            for(auto check:checks) {
+                for(auto* value:{&check.title,&check.detail})for(char& c:*value)if(c=='\t'||c=='\r'||c=='\n')c=' ';
+                report+=check.state+"\t"+check.title+"\t"+check.detail+"\n";
+            }
+            reply(true,{report});
+        } else if(action==L"install_diagnostics" && fields.size()==3) {
+            std::wstring resolved;std::string message;
+            if(!ResolveProjectWebIndex(resolved)||resolved!=g_state.indexPath){reply(false,{"请先打开工程对应网页"});return;}
+            const bool ok=DiagnosticsInstall::Install(resolved,RuntimeDiagnosticsScript(),message);
+            reply(ok,{message});
+        } else if((action==L"inspect" || action==L"repair" || action==L"locate") && fields.size()==4) {
+            IdeEventRouter::UiEvent event;
+            if(!IdeEventRouter::TryParseWebMessage(fields[3],event)) { reply(false,{"无效的控件信息"}); return; }
+            if(action==L"inspect") {
+                const auto state=IdeEventRouter::InspectBinding(event);
+                reply(true,{state.status,state.message,state.normalized.assemblyName,state.normalized.handlerName,state.normalized.callParam});
+            } else {
+                const auto result=IdeEventRouter::OperateBinding(g_state.mainWindow,g_state.mdiClient,event,action==L"locate");
+                reply(result.succeeded,{result.message});
+            }
+        } else if(action==L"common_preview" && fields.size()==6) {
+            CommonCode::Options options;
+            if(!CommonCode::ParseCommand(L"JADE_COMMAND\tgenerate_common\t"+fields[3]+L"\t"+fields[4]+L"\t"+fields[5],options)) {
+                reply(false,{"公共代码选项无效"}); return;
+            }
+            g_commonPreview=IdeEventRouter::PreviewCommonCode(g_state.mainWindow,options);
+            ReadRecentProjectPath(g_commonPreviewProject);
+            ++g_commonPreviewRevision;
+            reply(true,{std::to_string(g_commonPreviewRevision),g_commonPreview.ready?"1":"0",g_commonPreview.report,g_commonPreview.source,g_commonPreview.existing});
+        } else if(action==L"common_apply" && fields.size()==4) {
+            std::wstring project;
+            ReadRecentProjectPath(project);
+            if(project.empty() || project!=g_commonPreviewProject || fields[3]!=std::to_wstring(g_commonPreviewRevision) || !g_commonPreview.ready) { reply(false,{"预览已过期，请重新检查"}); return; }
+            const auto now=IdeEventRouter::PreviewCommonCode(g_state.mainWindow,g_commonPreview.options);
+            g_commonPreview.ready=false;
+            if(!now.ready || now.source!=g_commonPreview.source || now.existing!=g_commonPreview.existing || now.report!=g_commonPreview.report) {
+                reply(false,{"工程或模块已改变，请重新预览；未写入代码"}); return;
+            }
+            const auto result=IdeEventRouter::GenerateCommonCode(g_state.mainWindow,now.options);
+            reply(result.succeeded,{result.message});
+        } else if(action==L"text_open" || action==L"text_save" || action==L"text_undo" || action==L"visual_save") {
+            std::wstring resolved; std::string error;
+            if(!ResolveProjectWebIndex(resolved) || resolved!=g_state.indexPath) { reply(false,{"仅支持当前工程 web 中的本地 HTML，不修改内置页面"}); return; }
+            if(action==L"text_open") {
+                if(!g_textDocument.Open(resolved,error)) { reply(false,{error}); return; }
+            } else {
+                if(g_textDocument.path!=resolved) { reply(false,{"工程或页面已切换，请重新选择文字"}); return; }
+                bool ok=false;
+                if(action==L"text_undo") ok=g_textDocument.Undo(error);
+                else if(action==L"visual_save"&&fields.size()==5) {
+                    const auto number=[](const std::wstring& value) {return !value.empty()&&value.size()<=10&&value.find_first_not_of(L"0123456789")==value.npos;};
+                    if(!number(fields[3])||fields[4].size()>512*1024){reply(false,{"无效的控件修改请求"});return;}
+                    std::vector<DesignerVisual::Edit> edits;
+                    size_t lineStart=0;
+                    while(lineStart<fields[4].size()) {
+                        auto lineEnd=fields[4].find(L'\n',lineStart);if(lineEnd==std::wstring::npos)lineEnd=fields[4].size();
+                        const auto line=fields[4].substr(lineStart,lineEnd-lineStart);std::vector<std::wstring> values;
+                        for(size_t start=0;start<=line.size();) {
+                            auto end=line.find(L'\t',start);if(end==line.npos)end=line.size();
+                            values.push_back(DesignerText::Wide(IdeEventRouter::DecodeWireField(std::wstring_view(line).substr(start,end-start))));
+                            if(end==line.size())break;start=end+1;
+                        }
+                        if(values.size()!=6||!number(values[1])||!number(values[2])||edits.size()>=32){reply(false,{"无效的控件修改范围"});return;}
+                        edits.push_back({values[0],std::stoul(values[1]),std::stoul(values[2]),values[3],values[4],values[5]});
+                        lineStart=lineEnd+1;
+                    }
+                    for(const auto& edit:edits)if(edit.kind==L"insert") {
+                        if(DesignerVisual::Standard(edit.key,edit.value).empty()){reply(false,{"无效的新增控件"});return;}
+                        if(VisualNameAvailable(edit.key,edit.value,error)!=1){reply(false,{"回调名或频道已占用，或内存核验失败，请重新添加："+error});return;}
+                    }
+                    ok=DesignerVisual::Save(g_textDocument,static_cast<unsigned>(std::stoul(fields[3])),edits,error);
+                }
+                else if(fields.size()==8) {
+                    for(int i:{3,4,5}) if(fields[i].empty()||fields[i].size()>10||fields[i].find_first_not_of(L"0123456789")!=fields[i].npos) { reply(false,{"无效的文字位置"}); return; }
+                    ok=g_textDocument.Save(static_cast<unsigned>(std::stoul(fields[3])),std::stoul(fields[4]),std::stoul(fields[5]),fields[6],fields[7],error);
+                }
+                if(!ok) { reply(false,{error.empty()?"文字修改失败":error}); return; }
+                ReadWebDirLatestWrite(DirectoryOf(g_state.indexPath),g_state.lastWrite);
+                g_state.lastWriteValid=true;
+                if(action==L"text_undo" && g_state.webView) g_state.webView->Reload();
+                if(action==L"visual_save") g_nativeToolbox.Pointer();
+            }
+            reply(true,{std::to_string(g_textDocument.revision),g_textDocument.bytes,DesignerText::Utf8(resolved)});
+        } else reply(false,{"不支持的管理命令"});
+    } catch(const std::exception&) { reply(false,{"管理操作失败，未继续执行"}); }
 }
 
 HRESULT OnWebMessageReceived(
@@ -972,22 +1477,145 @@ HRESULT OnWebMessageReceived(
 
     const std::wstring wireMessage(message);
     CoTaskMemFree(message);
+    if(wireMessage.size()>4*1024*1024) return S_OK;
+    LPWSTR origin=nullptr;
+    const HRESULT sourceResult=args->get_Source(&origin);
+    const std::wstring sourceUrl=origin?origin:L"";
+    if(origin) CoTaskMemFree(origin);
+    const std::wstring expectedUrl=PathToUrl(g_state.indexPath);
+    if(FAILED(sourceResult) || !DesignerText::SameDocumentUrl(sourceUrl,expectedUrl)) return S_OK;
+    constexpr wchar_t dockPrefix[] = L"JADE_DOCK_TRACE\t";
+    if (wireMessage.starts_with(dockPrefix)) {
+        std::vector<std::string> fields;
+        const auto body = std::wstring_view(wireMessage).substr(std::size(dockPrefix) - 1);
+        for (size_t start = 0; start <= body.size();) {
+            const size_t end = body.find(L'\t', start);
+            const size_t stop = end == std::wstring_view::npos ? body.size() : end;
+            fields.push_back(IdeEventRouter::DecodeWireField(body.substr(start, stop - start)));
+            if (end == std::wstring_view::npos) break;
+            start = end + 1;
+        }
+        if (fields.size() >= 10) {
+            g_nativeDiagnostics.Add(
+                DesignerText::Wide(fields[5]), DesignerText::Wide(fields[9]),
+                DesignerText::Wide(fields[6]));
+        }
+        return S_OK;
+    }
+    if (LogIgnoredControl(wireMessage)) {
+        return S_OK;
+    }
     IdeEventRouter::UiEvent event;
-    if (!IdeEventRouter::TryParseWebMessage(wireMessage, event)) {
-        DesignerLog::Write("UI_EVENT ignored invalid_wire_message");
+    CommonCode::Options commonOptions;
+    const bool commonCommand = CommonCode::ParseCommand(wireMessage, commonOptions);
+    const bool toolCommand=wireMessage.starts_with(L"JADE_TOOL\t");
+    if (!commonCommand && wireMessage.find(L"JADE_COMMAND\tgenerate_common") == 0) {
+        if (g_state.webView) g_state.webView->PostWebMessageAsString(
+            L"JADE_COMMON_RESULT\t0\t公共代码选项无效，未写入工程。");
+        return S_OK;
+    }
+    if (!commonCommand && !toolCommand && !IdeEventRouter::TryParseWebMessage(wireMessage, event)) {
+        // Not one of the bridge's messages at all (the page may post its own).
+        // Anything the bridge sent now reaches Route, which reports what it
+        // cannot do rather than leaving the click unanswered.
+        DesignerLog::Write(
+            "UI_EVENT ignored not_a_jade_event len=" +
+            std::to_string(wireMessage.size()));
         return S_OK;
     }
 
-    const IdeEventRouter::RouteResult result = IdeEventRouter::Route(
-        g_state.mainWindow, g_state.mdiClient, event);
+    if (g_state.hostWindow == nullptr || !IsWindow(g_state.hostWindow)) {
+        DesignerLog::Write("UI_EVENT queue_failed reason=preview_window_unavailable");
+        return S_OK;
+    }
+    auto* pending = new (std::nothrow) PendingUiEvent{};
+    if (pending == nullptr) {
+        DesignerLog::Write("UI_EVENT queue_failed reason=out_of_memory");
+        return S_OK;
+    }
+    pending->generation = generation;
+    pending->documentGeneration = g_state.documentGeneration;
+    pending->event = std::move(event);
+    pending->commonCommand = commonCommand;
+    pending->commonOptions = std::move(commonOptions);
+    pending->toolMessage=toolCommand?wireMessage:L"";
+    ReadRecentProjectPath(pending->projectPath);
+    pending->indexPath=g_state.indexPath;
+    if(!toolCommand&&!commonCommand&&std::count(wireMessage.begin(),wireMessage.end(),L'\t')==10) {
+        const auto id=wireMessage.substr(wireMessage.find_last_of(L'\t')+1);
+        if(!id.empty()&&id.size()<=16&&id.find_first_not_of(L"0123456789")==id.npos)pending->traceId=id;
+    }
+    if (!PostMessageW(
+            g_state.hostWindow,
+            kRouteUiEventMessage,
+            0,
+            reinterpret_cast<LPARAM>(pending))) {
+        delete pending;
+        DesignerLog::Write(
+            "UI_EVENT queue_failed reason=post_message error=" +
+            std::to_string(GetLastError()));
+        return S_OK;
+    }
+    DesignerLog::Write("UI_EVENT queued route=preview_window");
+    return S_OK;
+}
+
+void ProcessQueuedUiEvent(PendingUiEvent* rawPending)
+{
+    std::unique_ptr<PendingUiEvent> pending(rawPending);
+    if (!pending || g_state.shuttingDown ||
+        pending->generation != g_state.generation ||
+        pending->documentGeneration != g_state.documentGeneration ||
+        g_state.mainWindow == nullptr || g_state.mdiClient == nullptr ||
+        !IsWindow(g_state.mainWindow) || !IsWindow(g_state.mdiClient)) {
+        DesignerLog::Write("UI_EVENT dropped queued_event=stale_or_invalid_context");
+        return;
+    }
+
+    std::wstring currentProject;
+    ReadRecentProjectPath(currentProject);
+    if(pending->projectPath!=currentProject || pending->indexPath!=g_state.indexPath) return;
+    if(!pending->toolMessage.empty()) { ProcessDesignerTool(pending->toolMessage); return; }
+
+    IdeEventRouter::RouteResult result{
+        false, "exception", "UI event processing failed"};
+    try {
+        result = pending->commonCommand
+        ? IdeEventRouter::GenerateCommonCode(g_state.mainWindow, pending->commonOptions)
+            : IdeEventRouter::Route(g_state.mainWindow, g_state.mdiClient, pending->event);
+    }
+    catch (const std::exception& error) {
+        result = {false, "exception", std::string("UI事件处理失败：") + error.what()};
+        DesignerLog::Write(
+            "UI_EVENT route_exception what=\"" + std::string(error.what()) + "\"");
+    }
+    catch (...) {
+        result = {false, "exception", "UI event processing exception: unknown"};
+        DesignerLog::Write("UI_EVENT route_exception what=unknown");
+    }
+
     DesignerLog::Write(
         "UI_EVENT result success=" + std::to_string(result.succeeded ? 1 : 0) +
         " action=" + result.action + " message=\"" + result.message + "\"");
-    if (g_state.webView) {
+    if (g_state.webView && pending->generation==g_state.generation && pending->documentGeneration==g_state.documentGeneration) {
+        if (pending->commonCommand) {
+            const std::wstring reply = std::wstring(L"JADE_COMMON_RESULT\t") +
+                (result.succeeded ? L"1\t" : L"0\t") + IdeEventRouter::BuildAckMessage(result);
+            g_state.webView->PostWebMessageAsString(reply.c_str());
+            return;
+        }
         const std::wstring acknowledgement = IdeEventRouter::BuildAckMessage(result);
         g_state.webView->PostWebMessageAsString(acknowledgement.c_str());
+        if(!pending->traceId.empty()) {
+            const auto trace=L"JADE_TRACE_RESULT\t"+pending->traceId+(result.succeeded?L"\t1\t":L"\t0\t")+ToolEncode(result.action);
+            g_state.webView->PostWebMessageAsString(trace.c_str());
+        }
+        if (result.succeeded && result.action == "create_background" && !result.notice.empty()) {
+            const std::wstring notice = L"JADE_NOTICE\t" + result.notice;
+            const HRESULT sent = g_state.webView->PostWebMessageAsString(notice.c_str());
+            DesignerLog::Write("PREVIEW creation_notice hr=" + HResultText(sent));
+        }
     }
-    return S_OK;
 }
 
 HRESULT OnNavigationCompleted(
@@ -1009,6 +1637,7 @@ HRESULT OnNavigationCompleted(
         " web_error_status=" + std::to_string(static_cast<int>(status)));
     if (succeeded != FALSE) {
         InstallUiEventBridge();
+        InstallRuntimeDiagnostics();
         RunFitToWindow();
         g_state.fitPending = true; // re-check once after late layout/font settle
     }
@@ -1056,7 +1685,20 @@ HRESULT OnControllerCreated(
     g_state.webMessageTokenValid = SUCCEEDED(webMessageResult);
     DesignerLog::Write(
         "PREVIEW add_WebMessageReceived hr=" + HResultText(webMessageResult));
-    DesignerLog::Write("PREVIEW ui_event_bridge_build=5 native_menu_page_edit=1");
+    DesignerLog::Write("PREVIEW ui_event_bridge_build=15 designer_tools=1 health=1 diagnostics=1 compact_tools=1 visual_design=1 native_toolbox=1 pixel_nudge=1 element_description=1 floating_toolbox=1 explicit_design_panel=1");
+
+    auto startingHandler = Callback<ICoreWebView2NavigationStartingEventHandler>(
+        [generation](ICoreWebView2*,ICoreWebView2NavigationStartingEventArgs*) -> HRESULT {
+            if(generation==g_state.generation) {
+                ++g_state.documentGeneration;
+                g_commonPreview.ready=false;
+                g_visualDesignMode=false;
+                PostMessageW(g_state.hostWindow,kNativeToolboxMessage,0,0);
+            }
+            return S_OK;
+        });
+    g_state.navigationStartingTokenValid=SUCCEEDED(g_state.webView->add_NavigationStarting(
+        startingHandler.Get(),&g_state.navigationStartingToken));
 
     auto navigationHandler = Callback<ICoreWebView2NavigationCompletedEventHandler>(
         [generation](ICoreWebView2* view, ICoreWebView2NavigationCompletedEventArgs* args) {
@@ -1188,6 +1830,9 @@ void PaintHostBackground(HWND window)
 LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
     if (g_state.shuttingDown && message != WM_NCDESTROY) {
+        if (message == kRouteUiEventMessage) {
+            delete reinterpret_cast<PendingUiEvent*>(lParam);
+        }
         return 0;
     }
     switch (message) {
@@ -1218,6 +1863,7 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
                 ? "PREVIEW native_mdi_activated"
                 : "PREVIEW native_mdi_deactivated");
         }
+        PostMessageW(window,kNativeToolboxMessage,0,0);
         if (g_state.controller) {
             g_state.controller->put_IsVisible(active ? TRUE : FALSE);
         }
@@ -1243,12 +1889,20 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
     case kMaximizeDocumentMessage:
         MaximizeMdiDocument(reinterpret_cast<HWND>(wParam));
         return 0;
+    case kRouteUiEventMessage:
+        ProcessQueuedUiEvent(reinterpret_cast<PendingUiEvent*>(lParam));
+        return 0;
+    case kNativeToolboxMessage:
+        g_nativeToolbox.SetEditable(g_visualDesignMode);
+        g_nativeToolbox.Update(WebPreview::IsActive());
+        return 0;
     case WM_TIMER:
         if (wParam == kRefreshTimerId) {
             RetryCodeTabCaption();
             UpdateCompatTabLayout();
             WebPreview::Layout();
             PollFileChanges();
+            g_nativeToolbox.Update(WebPreview::IsActive());
             return 0;
         }
         break;
@@ -1343,6 +1997,17 @@ bool Attach(HWND mainWindow, HWND mdiClient, HWND codeTab)
     g_state.mainWindow = mainWindow;
     g_state.mdiClient = mdiClient;
     g_state.codeTab = codeTab;
+    g_nativeToolbox.Initialize(mainWindow,g_state.module,[] { IdeEventRouter::ToggleNativeComponentBar(); },
+        [](const std::wstring& kind) {
+            if(g_state.webView && (kind==L"pointer" || kind==L"unavailable" || (g_visualDesignMode && WebPreview::IsActive())))
+                g_state.webView->PostWebMessageAsString((L"JADE_NATIVE_TOOLBOX\t"+kind).c_str());
+        });
+    g_nativeDiagnostics.Initialize(mainWindow, g_state.module,
+        [](const std::wstring& assembly, const std::wstring& callback) {
+            ProjectAssembly::JumpToSubroutine(
+                g_state.mainWindow, g_state.mdiClient, assembly, callback);
+        });
+    g_nativeDiagnostics.Ensure();
     g_state.tabCaptionEverUpdated = false;
     g_state.tabCaptionUpdateAttempts = 0;
     CaptureCodeTabInsertionPoint();
@@ -1472,6 +2137,8 @@ void Refresh()
 
 void Layout()
 {
+    g_nativeDiagnostics.Ensure();
+    g_nativeDiagnostics.Layout();
     UpdateCompatTabLayout();
     if (g_state.hostWindow != nullptr && IsWindow(g_state.hostWindow)) {
         ResizeController();
@@ -1498,6 +2165,9 @@ bool IsAttached()
 
 void Shutdown()
 {
+    g_nativeToolbox.Shutdown();
+    g_nativeDiagnostics.Shutdown();
+    g_visualDesignMode=false;
     g_state.shuttingDown = true;
     ++g_state.generation;
     g_state.active = false;
@@ -1517,6 +2187,10 @@ void Shutdown()
         g_state.webView->remove_NavigationCompleted(g_state.navigationToken);
     }
     g_state.navigationTokenValid = false;
+    if(g_state.webView && g_state.navigationStartingTokenValid) {
+        g_state.webView->remove_NavigationStarting(g_state.navigationStartingToken);
+    }
+    g_state.navigationStartingTokenValid=false;
     if (g_state.webView && g_state.webMessageTokenValid) {
         g_state.webView->remove_WebMessageReceived(g_state.webMessageToken);
     }

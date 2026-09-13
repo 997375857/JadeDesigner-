@@ -12,6 +12,7 @@
     <ClCompile Include="src\IDEIntegration.cpp"><Filter>src</Filter></ClCompile>
     <ClCompile Include="src\IdeEventRouter.cpp"><Filter>src</Filter></ClCompile>
     <ClCompile Include="src\PluginEntry.cpp"><Filter>src</Filter></ClCompile>
+    <ClCompile Include="src\ProjectAssembly.cpp"><Filter>src</Filter></ClCompile>
     <ClCompile Include="src\WebPreview.cpp"><Filter>src</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -25,6 +26,8 @@
     <ClInclude Include="src\DesignerLog.h"><Filter>src</Filter></ClInclude>
     <ClInclude Include="src\IDEIntegration.h"><Filter>src</Filter></ClInclude>
     <ClInclude Include="src\IdeEventRouter.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\ProjectAssembly.h"><Filter>src</Filter></ClInclude>
+    <ClInclude Include="src\PageSource.h"><Filter>src</Filter></ClInclude>
     <ClInclude Include="src\WebPreview.h"><Filter>src</Filter></ClInclude>
     <ClInclude Include="thirdparty\WebView2.h"><Filter>thirdparty</Filter></ClInclude>
   </ItemGroup>
