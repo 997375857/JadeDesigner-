@@ -1,0 +1,90 @@
+/* Portable component skin. Add jade-ui-control and the kind/preset classes to a control. */
+.jade-ui-control{
+  --jade-accent:var(--primary,#27292d);
+  --jade-paper:var(--paper,#fff);
+  --jade-ink:var(--ink,#27292d);
+  --jade-line:var(--line,#e5e5ea);
+  --jade-muted:color-mix(in srgb,var(--jade-ink) 62%,var(--jade-paper));
+  --jade-soft:color-mix(in srgb,var(--jade-ink) 3%,var(--jade-paper));
+  box-sizing:border-box;display:flex;align-items:center;gap:8px;min-width:0;
+  border:1px solid var(--jade-line);border-radius:6px;padding:9px 14px;
+  background:var(--jade-paper);color:var(--jade-ink);font:inherit;letter-spacing:0;
+}
+.jade-ui-control *{box-sizing:border-box}
+.jade-ui-control svg{width:18px;height:18px;flex:none}
+.jade-ui-control .node-label{min-width:0;overflow-wrap:anywhere}
+.jade-ui-control.kind-button{justify-content:center;font-weight:600;background:var(--jade-accent);color:#fff;border-color:color-mix(in srgb,var(--jade-accent) 85%,#000);box-shadow:0 4px 10px #00000020,inset 0 1px 0 #ffffff12}
+.jade-ui-control.kind-button.variant-outline{background:var(--jade-paper);color:var(--jade-ink);border-color:var(--jade-line);box-shadow:0 1px 2px #121c240a}
+.jade-ui-control.kind-button.variant-tonal{background:color-mix(in srgb,var(--jade-accent) 8%,var(--jade-paper));color:var(--jade-accent);border-color:color-mix(in srgb,var(--jade-accent) 20%,var(--jade-paper));box-shadow:none}
+.jade-ui-control.kind-button.variant-text{background:transparent;color:var(--jade-accent);border-color:transparent;box-shadow:none}
+.jade-ui-control.kind-button:hover{filter:brightness(.97)}
+.jade-ui-control:focus-visible{outline:2px solid var(--jade-accent);outline-offset:2px}
+.jade-ui-control:disabled{opacity:.5;cursor:not-allowed}
+.jade-ui-control:is(.kind-edit,.kind-select,.kind-number){background:var(--jade-soft);border-color:var(--jade-line);font-weight:400;box-shadow:inset 0 1px 2px #121c2403}
+.jade-ui-control.kind-edit .node-label{color:var(--jade-muted)}
+.jade-ui-control.kind-edit.preset-search .node-label{flex:1}
+.jade-ui-control .field-affix{display:flex;align-items:center;gap:10px;align-self:stretch;margin:-9px -14px -9px 0;padding:0 10px;border-left:1px solid var(--jade-line);color:var(--jade-muted)}
+.jade-ui-control .field-affix svg{width:14px;height:14px}
+.jade-ui-control.kind-super-list{flex-direction:column;align-items:stretch;gap:0;padding:0;overflow:hidden}
+.jade-ui-control .grid-head{display:grid;min-height:36px;flex:none;background:var(--jade-soft);color:var(--jade-muted);border-bottom:1px solid var(--jade-line);overflow:hidden}
+.jade-ui-control .grid-head>span{padding:10px 12px;font-weight:600;font-size:12px;border-right:1px solid var(--jade-line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.jade-ui-control .grid-head>span:last-child{border-right:0}
+.jade-ui-control .grid-empty{display:grid;place-items:center;flex:1;color:var(--jade-muted);font-size:12px;background-image:linear-gradient(transparent calc(100% - 1px),color-mix(in srgb,var(--jade-line) 45%,transparent) 1px)}
+.jade-ui-control:is(.kind-checkbox,.kind-radio,.kind-progress,.kind-slider,.kind-label){background:transparent;border-color:transparent;box-shadow:none}
+.jade-ui-control .check-mark,.jade-ui-control .radio-mark{display:inline-block;width:16px;height:16px;border:1px solid color-mix(in srgb,var(--jade-ink) 40%,var(--jade-paper));background:var(--jade-paper);flex:none;border-radius:3px}
+.jade-ui-control .radio-mark{border-radius:50%}
+.jade-ui-control input{accent-color:var(--jade-accent)}
+.jade-ui-control progress{appearance:none;width:100%;height:8px;border:0;border-radius:8px;overflow:hidden;background:var(--jade-line)}
+.jade-ui-control progress::-webkit-progress-bar{background:var(--jade-line);border-radius:8px}
+.jade-ui-control progress::-webkit-progress-value{background:var(--jade-accent);border-radius:8px}
+.jade-ui-control progress::-moz-progress-bar{background:var(--jade-accent)}
+.jade-ui-control input[type=range]{appearance:none;width:100%;height:6px;padding:0;margin:0;border:0;border-radius:6px;background:linear-gradient(to right,var(--jade-accent) var(--jade-range-fill,50%),var(--jade-line) var(--jade-range-fill,50%));outline:none}
+.jade-ui-control input[type=range]::-webkit-slider-thumb{appearance:none;width:16px;height:16px;border-radius:50%;background:var(--jade-paper);border:2px solid var(--jade-accent);box-shadow:0 1px 3px #121c241c}
+.jade-ui-control input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:var(--jade-paper);border:2px solid var(--jade-accent)}
+.jade-ui-control input[type=range]:focus-visible{outline:2px solid var(--jade-accent);outline-offset:5px}
+.jade-ui-control.kind-tree{flex-direction:column;align-items:stretch;gap:4px;padding:10px}
+.jade-ui-control .tree-row{display:flex;align-items:center;gap:8px;min-height:32px;padding:4px 8px;border-radius:4px}
+.jade-ui-control .tree-row svg{width:15px;height:15px;color:var(--jade-muted)}
+.jade-ui-control .tree-row.tree-child{margin-left:20px;opacity:1;background:color-mix(in srgb,var(--jade-accent) 7%,var(--jade-paper));color:var(--jade-accent)}
+.jade-ui-control.kind-tabs{padding:4px;gap:4px;background:var(--jade-soft);align-items:stretch}
+.jade-ui-control.kind-tabs>span{display:flex;align-items:center;justify-content:center;flex:1;min-width:0;padding:4px 10px;white-space:normal;overflow-wrap:anywhere;color:var(--jade-muted);border:0;border-radius:4px}
+.jade-ui-control.kind-tabs>.tab-active{background:var(--jade-paper);color:var(--jade-accent);box-shadow:0 1px 3px #121c2410}
+.jade-ui-control:is(.preset-card,.preset-dialog){padding:0;gap:0;border-style:solid;background:var(--jade-paper);box-shadow:0 2px 8px #121c2408;flex-direction:column;align-items:stretch}
+.jade-ui-control .layout-title{display:flex;align-items:center;gap:8px;min-height:42px;padding:10px 14px;border-bottom:1px solid var(--jade-line);font-size:13px;font-weight:600}
+.jade-ui-control .layout-title>svg{margin-left:auto;color:var(--jade-muted);width:16px;height:16px}
+.jade-ui-control .layout-body{flex:1;min-height:0;display:flex;flex-direction:column;gap:12px;padding:14px;color:var(--jade-muted);font-size:12px;overflow:hidden}
+.jade-ui-control .layout-field{display:flex;align-items:center;gap:16px;min-height:32px}
+.jade-ui-control .layout-input{flex:1;height:32px;border:1px solid var(--jade-line);border-radius:5px;background:var(--jade-soft)}
+.jade-ui-control .dialog-actions{display:flex;justify-content:flex-end;gap:8px;border-top:1px solid var(--jade-line);padding:10px 14px;background:var(--jade-paper)}
+.jade-ui-control .dialog-actions>span{padding:6px 14px;border:1px solid var(--jade-line);border-radius:5px;font-size:12px;color:var(--jade-ink)}
+.jade-ui-control .dialog-actions>span:last-child{background:var(--jade-accent);border-color:var(--jade-accent);color:#fff}
+.jade-ui-control.preset-toolbar{align-items:center;background:var(--jade-paper);border-style:solid;gap:14px}
+.jade-ui-control.preset-toolbar .layout-title{padding:0;min-height:0;border:0;margin-right:auto}
+.jade-ui-control:is(.preset-sidebar,.preset-navigation-rail){background:var(--jade-paper);border-style:solid;padding:12px 8px}
+.jade-ui-control:is(.preset-sidebar,.preset-navigation-rail){display:flex;flex-direction:column;align-items:stretch;gap:16px}
+.jade-ui-control .nav-top{display:flex;align-items:center;gap:12px;min-height:24px;padding:0 8px;font-weight:600}
+.jade-ui-control .nav-items{display:flex;flex-direction:column;gap:6px}
+.jade-ui-control .nav-item{display:flex;align-items:center;gap:10px;padding:8px}
+.jade-ui-control .nav-label{font-size:13px;line-height:1.4;min-width:0;overflow-wrap:anywhere}
+.jade-ui-control .nav-icon{display:grid;place-items:center;flex:none;border-radius:20px}
+.jade-ui-control.preset-navigation-rail .nav-top{justify-content:center;padding:0}
+.jade-ui-control.preset-navigation-rail .nav-item{flex-direction:column;gap:4px;padding:0;text-align:center}
+.jade-ui-control.preset-navigation-rail .nav-icon{width:56px;max-width:100%;height:32px}
+.jade-ui-control .nav-item{position:relative;border:1px solid transparent;border-radius:6px;color:var(--jade-muted)}
+.jade-ui-control .nav-item.active{background:color-mix(in srgb,var(--jade-accent) 6%,var(--jade-paper));color:var(--jade-accent);border-color:color-mix(in srgb,var(--jade-accent) 15%,var(--jade-paper))}
+.jade-ui-control.preset-sidebar .nav-item.active::before{content:"";position:absolute;left:-1px;top:10px;bottom:10px;width:3px;border-radius:0 2px 2px 0;background:var(--jade-accent)}
+.jade-ui-control.preset-sidebar .nav-icon{display:grid;place-items:center;width:30px;height:30px;border-radius:6px;background:var(--jade-soft);color:var(--jade-muted)}
+.jade-ui-control.preset-sidebar .active .nav-icon{background:var(--jade-paper);color:var(--jade-accent)}
+.jade-ui-control.preset-navigation-rail .nav-item.active{border-color:transparent;background:transparent}
+.jade-ui-control.preset-navigation-rail .active .nav-icon{background:color-mix(in srgb,var(--jade-accent) 10%,var(--jade-paper));color:var(--jade-accent)}
+.jade-ui-control .switch-track{width:36px;height:20px;border-radius:12px;background:var(--jade-accent);position:relative;flex:none;box-shadow:inset 0 1px 2px #121c2414}
+.jade-ui-control .switch-track::after{content:"";position:absolute;right:3px;top:3px;width:14px;height:14px;background:#fff;border-radius:50%;box-shadow:0 1px 2px #121c2420}
+.jade-ui-control.preset-textarea{align-items:flex-start}
+.jade-ui-control.preset-heading{font-weight:600}
+.jade-ui-control.preset-badge{background:color-mix(in srgb,var(--jade-accent) 8%,var(--jade-paper));color:var(--jade-accent);border:1px solid color-mix(in srgb,var(--jade-accent) 12%,var(--jade-paper));justify-content:center}
+.jade-ui-control.preset-floating-button{border-radius:50%;box-shadow:0 3px 8px #121c2420}
+.jade-ui-control:is(.preset-divider,.preset-rectangle,.preset-ellipse){padding:0}
+.jade-ui-control.preset-divider{border:0;background:transparent;align-items:center}
+.jade-ui-control.preset-divider .shape-fill{width:100%;height:1px;background:var(--jade-line)}
+.jade-ui-control:is(.preset-rectangle,.preset-ellipse){background:color-mix(in srgb,var(--jade-accent) 8%,var(--jade-paper));border:1px solid color-mix(in srgb,var(--jade-accent) 30%,var(--jade-paper))}
+.jade-ui-control.preset-ellipse{border-radius:50%}

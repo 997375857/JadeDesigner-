@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ProjectAssembly {
 
@@ -25,6 +26,11 @@ HWND FindOpenDocument(HWND mdiClient, std::wstring_view name);
 Lookup Find(HWND mainWindow, std::wstring_view name);
 // Existing-but-closed must never fall through to creation if opening fails.
 Lookup FindAndOpen(HWND mainWindow, HWND mdiClient, std::wstring_view name);
+// Returns every assembly name from the validated program tree.
+std::vector<std::wstring> ListNames(HWND mainWindow);
+// Returns only user-code assemblies directly under the project root. Nested
+// support-library and internal model entries are deliberately excluded.
+std::vector<std::wstring> ListUserAssemblies(HWND mainWindow);
 bool JumpToSubroutine(HWND mainWindow, HWND mdiClient,
     std::wstring_view assembly, std::wstring_view subroutine);
 

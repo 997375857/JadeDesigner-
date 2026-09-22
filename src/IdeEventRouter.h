@@ -38,6 +38,8 @@ RouteResult Route(HWND mainWindow, HWND mdiClient, const UiEvent& event);
 RouteResult GenerateCommonCode(HWND mainWindow, CommonCode::Options options = {});
 struct BindingInfo { UiEvent normalized; std::string status, message; };
 BindingInfo InspectBinding(const UiEvent& event);
+// Shared by the native property page and the injected context menu.
+bool NormalizeControlEvent(UiEvent& event, std::string& error);
 RouteResult OperateBinding(HWND mainWindow, HWND mdiClient, const UiEvent& event, bool locateOnly);
 struct CommonPreview { bool ready = false; CommonCode::Options options; std::string source, existing, report; };
 CommonPreview PreviewCommonCode(HWND mainWindow, CommonCode::Options options);

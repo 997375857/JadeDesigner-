@@ -2521,8 +2521,187 @@ PageEnsureResult EnsureAssemblySubPage(
 
 #include "CommonCode.h"
 #include "DesignerInspection.h"
+#include "ListEventBinding.h"
+#include "DesignerControlCatalog.h"
 
 namespace IdeEventRouter {
+
+bool NormalizeControlEvent(UiEvent& event,std::string& error)
+{
+    if(event.controlType=="list")event.controlType="super-list";
+    const auto* capability=DesignerControlCatalog::Find(event.controlType,event.domEvent);
+    if(!capability){error="该控件尚未提供此事件";return false;}
+    if(!ListEventBinding::SafeId(event.elementId)){error="缺少稳定控件 ID 或 ID 含不支持的字符";return false;}
+    if(WideToAnsi(Utf8ToWide(event.elementId)).empty()){error="控件 ID 无法无损转换为易语言工程编码";return false;}
+    if(IsWindowControlEvent(event)||(!event.callType.empty()&&event.callType!="JadeView.通讯.订阅")) {
+        error="窗口控制或其他调用方式不在普通控件事件范围内";return false;
+    }
+    const bool list=event.controlType=="super-list";
+    if(event.handlerName.empty()||(list&&event.domEvent!="click")) {
+        event.handlerName=WideToUtf8(SanitizeIdentifier(Utf8ToWide(event.elementId),L"控件").substr(0,24))+
+            "_"+std::string(capability->label)+(list?"_"+ListEventBinding::Token(event.elementId):"");
+    } else event.handlerName=WideToUtf8(SanitizeIdentifier(Utf8ToWide(event.handlerName),L"控件事件"));
+    if(!event.assemblyName.empty())event.assemblyName=WideToUtf8(SanitizeIdentifier(Utf8ToWide(event.assemblyName),L"Jade_通讯_订阅集"));
+    if(WideToAnsi(Utf8ToWide(event.handlerName)).empty()||
+        (!event.assemblyName.empty()&&WideToAnsi(Utf8ToWide(event.assemblyName)).empty())) {
+        error="回调或程序集名称无法无损转换为易语言工程编码";return false;
+    }
+    event.callType="JadeView.通讯.订阅";
+    if(list)event.callParam="jade:list:event:"+event.elementId+":"+event.domEvent;
+    else if(event.callParam.empty())event.callParam="ui:"+event.elementId;
+    return true;
+}
+
+static ListEventBinding::Reader AssemblyReader() {
+    return [](const auto& name,auto& source,auto& error){return HookBridge::ReadAssembly(WideToAnsi(Utf8ToWide(name)),source,error);};
+}
+static ListEventBinding::Reader RoutineReader() {
+    return [](const auto& name,auto& source,auto& error){return HookBridge::ReadRoutine(WideToAnsi(Utf8ToWide(name)),source,error);};
+}
+static ListEventBinding::Plan ListPlan(const UiEvent& event) {
+    const auto* entry=DesignerControlCatalog::Find(event.controlType,event.domEvent);
+    return ListEventBinding::Make(event.elementId,event.domEvent,entry?std::string(entry->label):"",
+        event.handlerName,event.assemblyName);
+}
+static bool IsInternalTemporaryAssembly(const std::wstring& name) {
+    std::wstring lower=name;
+    std::transform(lower.begin(),lower.end(),lower.begin(),
+        [](wchar_t value){return static_cast<wchar_t>(std::towlower(value));});
+    return lower.find(L"_hidden_temp_")!=std::wstring::npos ||
+        lower.find(L"__hidden_temp_")!=std::wstring::npos;
+}
+static bool ResolveExistingListPlan(HWND mainWindow,const UiEvent& event,ListEventBinding::Plan& plan,std::string& error) {
+    std::string page;
+    if(!ReadPageCodeUtf8(page)) { error="无法读取当前易语言代码页，未写入事件"; return false; }
+    const auto pageInfo=ParsePageCode(page);
+    auto binding=ListEventBinding::FindExistingBinding(page,event.elementId);
+    DesignerLog::Write("LIST page_source_scan assembly=\""+pageInfo.assemblyUtf8+
+        "\" bytes="+std::to_string(page.size())+
+        " contains_id="+(page.find(event.elementId)!=std::string::npos?"1":"0")+
+        " contains_binder="+(page.find("Jade超级列表框绑定")!=std::string::npos?"1":"0")+
+        " binding_found="+(binding.found?"1":"0")+
+        " binding_ambiguous="+(binding.ambiguous?"1":"0"));
+    std::string foundAssembly=pageInfo.assemblyUtf8;
+    if(!binding.found&&!binding.ambiguous) {
+        // The binding is often kept in a user initialization assembly while
+        // the editor is showing Jade_通讯_订阅集. Walk the IDE program tree
+        // and read each assembly from memory instead of depending on the
+        // currently visible code page.
+        const auto names=ProjectAssembly::ListUserAssemblies(mainWindow);
+        DesignerLog::Write("LIST user_assembly_scan transport=program_tree_top_level count="+
+            std::to_string(names.size()));
+        std::string scannedAssemblyNames;
+        for(const auto& name:names) {
+            if(!scannedAssemblyNames.empty()) scannedAssemblyNames += "|";
+            scannedAssemblyNames += WideToUtf8(name);
+        }
+        DesignerLog::Write("LIST user_assembly_scan names=\""+scannedAssemblyNames+"\"");
+        if(names.empty()) {
+            error="无法读取易语言程序集列表，未写入事件";
+            return false;
+        }
+        std::set<std::wstring> scannedNames;
+        for(const auto& name:names) {
+            if(!scannedNames.insert(name).second)continue;
+            const auto nameUtf8=WideToUtf8(name);
+            if(IsInternalTemporaryAssembly(name)) {
+                DesignerLog::Write("LIST assembly_scan skipped_internal name=\""+nameUtf8+"\"");
+                continue;
+            }
+            std::string candidate,candidateError;
+            const int result=HookBridge::ReadAssembly(WideToAnsi(name),candidate,candidateError);
+            DesignerLog::Write("LIST assembly_scan read name=\""+nameUtf8+
+                "\" result="+std::to_string(result)+
+                " bytes="+std::to_string(candidate.size())+
+                " reason=\""+candidateError+"\"");
+            if(result<0) {
+                // An IDE may retain a duplicate hidden/imported assembly while
+                // the user project remains readable. It is unrelated unless
+                // it contains the requested binding, so keep scanning.
+                DesignerLog::Write("LIST assembly_scan skipped_unreadable name=\""+
+                    nameUtf8+"\" reason=\""+candidateError+"\"");
+                continue;
+            }
+            if(result!=1) continue;
+            const bool hasId=candidate.find(event.elementId)!=std::string::npos;
+            const bool hasBinder=candidate.find("Jade超级列表框绑定")!=std::string::npos;
+            if(hasId||hasBinder) {
+                DesignerLog::Write("LIST assembly_candidate name=\""+nameUtf8+
+                    "\" bytes="+std::to_string(candidate.size())+
+                    " contains_id="+(hasId?"1":"0")+
+                    " contains_binder="+(hasBinder?"1":"0"));
+            }
+            const auto candidateBinding=ListEventBinding::FindExistingBinding(candidate,event.elementId);
+            if(!candidateBinding.found&&!candidateBinding.ambiguous) continue;
+            if(binding.found||binding.ambiguous) { binding.ambiguous=true; break; }
+            binding=candidateBinding;foundAssembly=nameUtf8;
+        }
+    }
+    if(binding.ambiguous) { error="同一控件 ID 存在多个绑定赋值，未自动修改"; return false; }
+    if(!binding.found) {
+        error="未找到 Jade超级列表框绑定 (\""+event.elementId+"\")，请先在易语言中绑定并保存绑定子程序";
+        return false;
+    }
+    plan=ListPlan(event);
+    plan.existingBinding=true;
+    plan.assembly=foundAssembly;
+    plan.object=binding.object;
+    plan.initialize=binding.routine;
+    // Once the user's object variable is known, keep the callback name in
+    // the same Easy Language style: 全局_主播列表被单击. The HTML id is only
+    // the lookup key and must not leak a generated hash into the user API.
+    plan.handler=ListEventBinding::HandlerName(plan.object,plan.label);
+    plan.assignment=binding.assignment;
+    plan.registration=plan.object+".绑定事件 (\""+plan.label+"\", &"+plan.handler+")";
+    plan.callback=ListEventBinding::CallbackSource(plan.handler);
+    plan.initializer.clear();
+    plan.source.clear();
+    DesignerLog::Write("LIST existing_binding id=\""+event.elementId+"\" object=\""+
+        plan.object+"\" assembly=\""+plan.assembly+"\" routine=\""+plan.initialize+"\"");
+    return true;
+}
+static BindingInfo InspectListBinding(UiEvent event) {
+    std::string error;
+    if(!NormalizeControlEvent(event,error))return {event,"conflict",error};
+    ListEventBinding::Plan plan;
+    const HWND mainWindow=reinterpret_cast<HWND>(NotifySys(NES_GET_MAIN_HWND,0,0));
+    if(!ResolveExistingListPlan(mainWindow,event,plan,error)) {
+        event.assemblyName=event.assemblyName.empty()?ListEventBinding::SubscriptionAssembly:event.assemblyName;
+        return {event,"missing",error};
+    }
+    const auto inspection=ListEventBinding::InspectExisting(plan,AssemblyReader(),RoutineReader());
+    event.assemblyName=plan.callbackAssembly;
+    event.handlerName=plan.handler;
+    return {event,inspection.status,inspection.message};
+}
+static RouteResult GenerateListBinding(const UiEvent& raw) {
+    auto event=raw;std::string error;
+    if(!NormalizeControlEvent(event,error))return Fail("list_binding",error);
+    ListEventBinding::Plan plan;
+    const HWND mainWindow=reinterpret_cast<HWND>(NotifySys(NES_GET_MAIN_HWND,0,0));
+    if(!ResolveExistingListPlan(mainWindow,event,plan,error))return Fail("list_binding",error);
+    const auto current=ListEventBinding::InspectExisting(plan,AssemblyReader(),RoutineReader());
+    if(current.status=="complete")return {true,"preserved",current.message};
+    if(current.status!="missing")return Fail("list_binding",current.message);
+    if(!HookBridge::InspectHost().ok())return Fail("list_binding","请使用配套的 e5.95.exe");
+    std::string type,binder;
+    if(AssemblyReader()("JadeView超级列表框对象",type,error)!=1 ||
+        RoutineReader()("Jade超级列表框绑定",binder,error)!=1)
+        return Fail("list_dependency","未找到模块的超级列表框对象或绑定子程序："+error);
+    for(const auto& problem:{DesignerInspection::CallProblem(type,"绑定事件",2)})
+        if(!problem.empty())return Fail("list_dependency","模块接口不匹配："+problem);
+    const auto ansi=[](const std::string& value){return WideToAnsi(Utf8ToWide(value));};
+    // The user-owned binding routine is the single source of truth. The bridge
+    // only appends the missing object event and creates the callback in the
+    // shared subscription assembly; it never creates data-jade-name metadata.
+    HookBridge::BackgroundChange change{};
+    if(HookBridge::EnsureBackground(ansi(plan.callbackAssembly),ansi(plan.assembly),ansi(plan.initialize),
+        ansi(plan.handler),ansi(plan.registration),ansi(plan.callback),error,change)<1)
+        return Fail("list_binding","易语言绑定子程序未补齐事件，可修正后重试："+error);
+    const auto verified=ListEventBinding::InspectExisting(plan,AssemblyReader(),RoutineReader());
+    if(verified.status!="complete")return Fail("list_binding","写入后核验未通过："+verified.message);
+    return {true,"list_binding_created","已在现有超级列表框绑定对象上加入事件，并在 Jade_通讯_订阅集 中生成回调"};
+}
 
 void ToggleNativeComponentBar() { InvokeIde(FN_SWITCH_UNIT_BAR); }
 
@@ -2539,6 +2718,7 @@ std::vector<ProjectHealth::Check> InspectProjectHealth()
 
 BindingInfo InspectBinding(const UiEvent& event)
 {
+    if(event.controlType=="list"||event.controlType=="super-list")return InspectListBinding(event);
     BindingInfo info{event,"unknown",{}};
     if (IsWindowControlEvent(event) || event.callType == "JadeView.App.注册事件") {
         info.message="窗口控制或原生生命周期事件，不在普通控件修复范围"; return info;
@@ -2593,8 +2773,20 @@ RouteResult OperateBinding(HWND mainWindow, HWND mdiClient, const UiEvent& event
         if(HookBridge::ReadAssembly(WideToAnsi(Utf8ToWide(current.normalized.assemblyName)),source,error)!=1 ||
             DesignerInspection::Count(DesignerInspection::Routines(source),current.normalized.handlerName)!=1)
             return Fail("locate","回调不存在或不唯一，未创建代码");
-        const bool ok=ProjectAssembly::JumpToSubroutine(mainWindow,mdiClient,Utf8ToWide(current.normalized.assemblyName),Utf8ToWide(current.normalized.handlerName));
-        return {ok,"locate",ok ? "已定位回调" : "定位未完成，未写入代码"};
+        const auto assembly=Utf8ToWide(current.normalized.assemblyName);
+        const auto handler=Utf8ToWide(current.normalized.handlerName);
+        constexpr DWORD settleDelaysMs[]{0,80,180,320};
+        bool ok=false;
+        for(size_t attempt=0;attempt<std::size(settleDelaysMs)&&!ok;++attempt) {
+            if(settleDelaysMs[attempt])PumpMessagesFor(settleDelaysMs[attempt]);
+            ok=ProjectAssembly::JumpToSubroutine(mainWindow,mdiClient,assembly,handler);
+            DesignerLog::Write("LIST locate attempt="+std::to_string(attempt+1)+
+                " delay_ms="+std::to_string(settleDelaysMs[attempt])+
+                " assembly=\""+current.normalized.assemblyName+
+                "\" handler=\""+current.normalized.handlerName+
+                "\" success="+(ok?"1":"0"));
+        }
+        return {ok,"locate",ok ? "已定位回调" : "回调代码已存在，但 IDE 程序树尚未完成刷新"};
     }
     if(current.status=="complete") return {true,"preserved","绑定已完整，无需补齐"};
     if(current.status!="missing") return Fail("repair",current.message);
@@ -2645,12 +2837,13 @@ CommonPreview PreviewCommonCode(HWND mainWindow, CommonCode::Options options)
             if(HookBridge::ReadAssembly(WideToAnsi(r.type),text,error)!=1) text.clear();
             modules.emplace(r.type,std::move(text));
         }
-        if(!DesignerInspection::Method(modules[r.type],r.method,r.count)) {
+        const auto problem=DesignerInspection::CallProblem(modules[r.type],r.method,r.count);
+        if(!problem.empty()) {
             out.ready=false;
-            out.report += "缺少或签名不匹配："+WideToUtf8(r.type)+"."+r.method+"（参数 "+std::to_string(r.count)+" 个）\n";
+            out.report += "依赖检查未通过："+WideToUtf8(r.type)+"."+r.method+"（"+problem+"）\n";
         }
     }
-    out.report += "检查范围：当前工程内存中的方法名称和参数数量；运行 DLL 版本及实际行为仍需运行验证。\n";
+    out.report += "检查范围：当前工程内存中的方法名称、参数数量与尾部参数可省略标记；参数类型、运行 DLL 版本及实际行为仍需编译或运行验证。\n";
     return out;
 }
 
@@ -2737,6 +2930,7 @@ RouteResult Route(HWND mainWindow, HWND mdiClient, const UiEvent& event)
     }
     RoutingGuard routingGuard;
     ResetSessionCachesIfProjectChanged(mainWindow);
+    if(event.controlType=="list"||event.controlType=="super-list")return GenerateListBinding(event);
 
     // Nothing here identifies a callback: no data-jade-handler, no id/name/
     // title/aria-label to build a stable name from, no inline handler function,

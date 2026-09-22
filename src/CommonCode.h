@@ -54,6 +54,7 @@ JadeView.App.消息循环 ()
 设置.宽度 ＝ 1280
 设置.高度 ＝ 800
 设置.可调整大小边框 ＝ 真
+设置.边框样式 ＝ 标题栏_标准标题栏_带边框
 设置.最大化按钮 ＝ 真
 设置.最小化按钮 ＝ 真
 设置.隐藏窗口 ＝ 假
@@ -140,67 +141,58 @@ inline bool ParseCommand(std::wstring_view wire, Options& options) {
     return options.appId.empty() || ValidAppId(options.appId);
 }
 
-inline constexpr wchar_t StateApi[] = LR"EPL(.DLL命令 Jade_公共_API_交换, 整数型, "kernel32.dll", "InterlockedExchange"
-.参数 目标, 整数型, 传址
-.参数 新值, 整数型
-
-.DLL命令 Jade_公共_API_比较交换, 整数型, "kernel32.dll", "InterlockedCompareExchange"
-.参数 目标, 整数型, 传址
-.参数 新值, 整数型
-.参数 比较值, 整数型
-
-)EPL";
-
 inline constexpr wchar_t Lifecycle[] = LR"EPL(
-.子程序 Jade_公共_读状态, 整数型
+.子程序 Jade_内部_读状态, 整数型
 .参数 状态, 整数型, 参考
 
-返回 (Jade_公共_API_比较交换 (状态, 0, 0))
+返回 (状态)
 
-.子程序 Jade_公共_真正退出
+.子程序 Jade_内部_真正退出
 
-.如果真 (Jade_公共_API_交换 (Jade_公共_退出中, 1) ≠ 0)
+.如果真 (Jade_内部_退出中 ≠ 0)
     返回 ()
 .如果真结束
-Jade_公共_清理托盘 ()
+Jade_内部_退出中 ＝ 1
+Jade_内部_清理托盘 ()
 JadeView.App.退出 ()
 
-.子程序 Jade_公共_显示主窗口
+.子程序 Jade_内部_显示主窗口
 .局部变量 窗口ID, 整数型
 
-.如果真 (Jade_公共_读状态 (Jade_公共_退出中) ≠ 0)
+.如果真 (Jade_内部_读状态 (Jade_内部_退出中) ≠ 0)
     返回 ()
 .如果真结束
-Jade_公共_API_交换 (Jade_公共_等待恢复, 1)
-窗口ID ＝ Jade_公共_读状态 (Jade_公共_主窗口ID)
+Jade_内部_等待恢复 ＝ 1
+窗口ID ＝ Jade_内部_读状态 (Jade_内部_主窗口ID)
 .如果真 (窗口ID ＝ 0)
     返回 ()
 .如果真结束
 .如果真 (JadeView.窗口.设置窗口显示或隐藏 (窗口ID, 真) ＝ 假)
     返回 ()
 .如果真结束
-Jade_公共_API_交换 (Jade_公共_等待恢复, 0)
+Jade_内部_等待恢复 ＝ 0
 JadeView.窗口.设置焦点 (窗口ID)
 
-.子程序 Jade_公共_窗口就绪
+.子程序 Jade_公共_窗口创建完毕
 .参数 窗口ID, 整数型
 .参数 数据, 文本型
 
-.如果真 (窗口ID ＝ Jade_公共_读状态 (Jade_公共_主窗口ID) 且 Jade_公共_读状态 (Jade_公共_等待恢复) ≠ 0)
-    Jade_公共_显示主窗口 ()
+.如果真 (窗口ID ＝ Jade_内部_读状态 (Jade_内部_主窗口ID) 且 Jade_内部_读状态 (Jade_内部_等待恢复) ≠ 0)
+    Jade_内部_显示主窗口 ()
 .如果真结束
 
 .子程序 Jade_公共_窗口已关闭
 .参数 窗口ID, 整数型
 .参数 数据, 文本型
 
-.如果真 (窗口ID ≠ 0 且 Jade_公共_API_比较交换 (Jade_公共_主窗口ID, 0, 窗口ID) ＝ 窗口ID)
-    Jade_公共_真正退出 ()
+.如果真 (窗口ID ≠ 0 且 窗口ID ＝ Jade_内部_主窗口ID)
+    Jade_内部_主窗口ID ＝ 0
+    Jade_内部_真正退出 ()
 .如果真结束
 )EPL";
 
 inline constexpr wchar_t TraySource[] = LR"EPL(
-.子程序 Jade_公共_注册托盘事件, 逻辑型
+.子程序 Jade_内部_注册托盘事件, 逻辑型
 
 .如果真 (JadeView.App.注册事件 ("window-closing", &Jade_公共_窗口关闭前) ＝ 0)
     返回 (假)
@@ -213,7 +205,7 @@ inline constexpr wchar_t TraySource[] = LR"EPL(
 .如果真结束
 返回 (真)
 
-.子程序 Jade_公共_创建托盘
+.子程序 Jade_内部_创建托盘
 .局部变量 托盘ID, 整数型
 .局部变量 菜单, 托盘菜单选项, , "2"
 .局部变量 图标路径, 文本型
@@ -232,7 +224,7 @@ inline constexpr wchar_t TraySource[] = LR"EPL(
 .如果真 (托盘ID ＝ 0)
     返回 ()
 .如果真结束
-Jade_公共_API_交换 (Jade_公共_托盘ID, 托盘ID)
+Jade_内部_托盘ID ＝ 托盘ID
 菜单 [1].菜单项类型 ＝ 0
 菜单 [1].菜单项Key ＝ "jade_common_show"
 菜单 [1].菜单项显示文本 ＝ GBK文本到UTF8文本 ("显示主窗口")
@@ -241,29 +233,30 @@ Jade_公共_API_交换 (Jade_公共_托盘ID, 托盘ID)
 菜单 [2].菜单项显示文本 ＝ GBK文本到UTF8文本 ("退出程序")
 菜单 [2].是否标记为危险操作 ＝ 真
 .如果真 (JadeView.托盘.设置图标 (托盘ID, 图标路径) ＝ 假)
-    Jade_公共_清理托盘 ()
+    Jade_内部_清理托盘 ()
     返回 ()
 .如果真结束
 .如果真 (JadeView.托盘.设置菜单项 (托盘ID, 菜单) ＝ 假)
-    Jade_公共_清理托盘 ()
+    Jade_内部_清理托盘 ()
     返回 ()
 .如果真结束
 JadeView.托盘.设置提示文本 (托盘ID, "Jade应用")
 .如果真 (JadeView.托盘.显示图标 (托盘ID) ＝ 假)
-    Jade_公共_清理托盘 ()
+    Jade_内部_清理托盘 ()
     返回 ()
 .如果真结束
-.如果真 (Jade_公共_读状态 (Jade_公共_退出中) ≠ 0)
-    Jade_公共_清理托盘 ()
+.如果真 (Jade_内部_读状态 (Jade_内部_退出中) ≠ 0)
+    Jade_内部_清理托盘 ()
     返回 ()
 .如果真结束
-Jade_公共_API_交换 (Jade_公共_托盘就绪, 1)
+Jade_内部_托盘就绪 ＝ 1
 
-.子程序 Jade_公共_清理托盘
+.子程序 Jade_内部_清理托盘
 .局部变量 托盘ID, 整数型
 
-Jade_公共_API_交换 (Jade_公共_托盘就绪, 0)
-托盘ID ＝ Jade_公共_API_交换 (Jade_公共_托盘ID, 0)
+Jade_内部_托盘就绪 ＝ 0
+托盘ID ＝ Jade_内部_托盘ID
+Jade_内部_托盘ID ＝ 0
 .如果真 (托盘ID ≠ 0)
     JadeView.托盘.销毁 (托盘ID)
 .如果真结束
@@ -273,10 +266,10 @@ Jade_公共_API_交换 (Jade_公共_托盘就绪, 0)
 .参数 数据, 文本型
 
 ' 同步关闭拦截：不等待、不弹框，仅在托盘与恢复入口均可用时隐藏主窗口。
-.如果真 (Jade_公共_读状态 (Jade_公共_退出中) ≠ 0 或 窗口ID ≠ Jade_公共_读状态 (Jade_公共_主窗口ID))
+.如果真 (Jade_内部_读状态 (Jade_内部_退出中) ≠ 0 或 窗口ID ≠ Jade_内部_读状态 (Jade_内部_主窗口ID))
     返回 (0)
 .如果真结束
-.如果真 (Jade_公共_读状态 (Jade_公共_托盘就绪) ＝ 0)
+.如果真 (Jade_内部_读状态 (Jade_内部_托盘就绪) ＝ 0)
     返回 (0)
 .如果真结束
 .如果真 (JadeView.窗口.设置窗口显示或隐藏 (窗口ID, 假))
@@ -290,15 +283,15 @@ Jade_公共_API_交换 (Jade_公共_托盘就绪, 0)
 .局部变量 事件, 类_json
 
 .如果真 (事件.解析 (UTF8文本到GBK文本 (数据), 真, ) ＝ 假)
-    Jade_公共_显示主窗口 ()
-    Jade_公共_清理托盘 ()
+    Jade_内部_显示主窗口 ()
+    Jade_内部_清理托盘 ()
     返回 ()
 .如果真结束
-.如果真 (Jade_公共_读状态 (Jade_公共_托盘就绪) ＝ 0 或 事件.取属性数值 ("tray_id") ≠ Jade_公共_读状态 (Jade_公共_托盘ID))
+.如果真 (Jade_内部_读状态 (Jade_内部_托盘就绪) ＝ 0 或 事件.取属性数值 ("tray_id") ≠ Jade_内部_读状态 (Jade_内部_托盘ID))
     返回 ()
 .如果真结束
 .如果真 (事件.取通用属性 ("event", ) ＝ "left-click" 或 事件.取通用属性 ("event", ) ＝ "double-click")
-    Jade_公共_显示主窗口 ()
+    Jade_内部_显示主窗口 ()
 .如果真结束
 
 .子程序 Jade_公共_托盘菜单
@@ -307,17 +300,17 @@ Jade_公共_API_交换 (Jade_公共_托盘就绪, 0)
 .局部变量 事件, 类_json
 
 .如果真 (事件.解析 (UTF8文本到GBK文本 (数据), 真, ) ＝ 假)
-    Jade_公共_显示主窗口 ()
-    Jade_公共_清理托盘 ()
+    Jade_内部_显示主窗口 ()
+    Jade_内部_清理托盘 ()
     返回 ()
 .如果真结束
-.如果真 (Jade_公共_读状态 (Jade_公共_托盘就绪) ＝ 0 或 事件.取属性数值 ("tray_id") ≠ Jade_公共_读状态 (Jade_公共_托盘ID))
+.如果真 (Jade_内部_读状态 (Jade_内部_托盘就绪) ＝ 0 或 事件.取属性数值 ("tray_id") ≠ Jade_内部_读状态 (Jade_内部_托盘ID))
     返回 ()
 .如果真结束
 .判断开始 (事件.取通用属性 ("key", ) ＝ "jade_common_show")
-    Jade_公共_显示主窗口 ()
+    Jade_内部_显示主窗口 ()
 .判断 (事件.取通用属性 ("key", ) ＝ "jade_common_exit")
-    Jade_公共_真正退出 ()
+    Jade_内部_真正退出 ()
 .默认
 .判断结束
 )EPL";
@@ -342,26 +335,26 @@ inline std::wstring BuildSource(const Options& options) {
         std::wstring(options.tray ? L"1" : L"0") + L";s=" + (options.singleInstance ? L"1" : L"0") +
         L";id=" + options.appId + L"\")\n";
     if (!options.tray && !options.singleInstance) return s;
-    replace(L".程序集 Jade_公共基础\n", std::wstring(StateApi) + LR"EPL(.程序集 Jade_公共基础
-.程序集变量 Jade_公共_主窗口ID, 整数型
-.程序集变量 Jade_公共_退出中, 整数型
-.程序集变量 Jade_公共_等待恢复, 整数型
-.程序集变量 Jade_公共_启动过, 整数型
-.程序集变量 Jade_公共_托盘ID, 整数型
-.程序集变量 Jade_公共_托盘就绪, 整数型
+    replace(L".程序集 Jade_公共基础\n", LR"EPL(.程序集 Jade_公共基础
+.程序集变量 Jade_内部_主窗口ID, 整数型
+.程序集变量 Jade_内部_退出中, 整数型
+.程序集变量 Jade_内部_等待恢复, 整数型
+.程序集变量 Jade_内部_启动过, 整数型
+.程序集变量 Jade_内部_托盘ID, 整数型
+.程序集变量 Jade_内部_托盘就绪, 整数型
 )EPL");
-    replace(L"JadeView.App.注册事件 (\"app-ready\"", LR"EPL(.如果真 (Jade_公共_API_交换 (Jade_公共_启动过, 1) ≠ 0)
+    replace(L"JadeView.App.注册事件 (\"app-ready\"", LR"EPL(.如果真 (Jade_内部_启动过 ≠ 0)
     返回 (0)
 .如果真结束
-JadeView.App.注册事件 ("window-created", &Jade_公共_窗口就绪)
-JadeView.App.注册事件 ("webview-did-finish-load", &Jade_公共_窗口就绪)
+Jade_内部_启动过 ＝ 1
+JadeView.App.注册事件 ("window-created", &Jade_公共_窗口创建完毕)
 JadeView.App.注册事件 ("window-closed", &Jade_公共_窗口已关闭)
 JadeView.App.注册事件 ("app-ready")EPL");
-    replace(L".如果真 (窗口ID ＝ 0)", L"Jade_公共_API_交换 (Jade_公共_主窗口ID, 窗口ID)\n.如果真 (Jade_公共_读状态 (Jade_公共_等待恢复) ≠ 0)\n    Jade_公共_显示主窗口 ()\n.如果真结束\n.如果真 (窗口ID ＝ 0)");
+    replace(L".如果真 (窗口ID ＝ 0)", L"Jade_内部_主窗口ID ＝ 窗口ID\n.如果真 (Jade_内部_读状态 (Jade_内部_等待恢复) ≠ 0)\n    Jade_内部_显示主窗口 ()\n.如果真结束\n.如果真 (窗口ID ＝ 0)");
     // All exit sites funnel through a guarded, real shutdown.
     size_t p = 0;
     while ((p = s.find(L"JadeView.App.退出 ()", p)) != std::wstring::npos) {
-        s.replace(p, std::wstring_view(L"JadeView.App.退出 ()").size(), L"Jade_公共_真正退出 ()"); ++p;
+        s.replace(p, std::wstring_view(L"JadeView.App.退出 ()").size(), L"Jade_内部_真正退出 ()"); ++p;
     }
     s += Lifecycle;
     if (options.singleInstance) {
@@ -371,21 +364,21 @@ JadeView.App.注册事件 ("app-ready")EPL");
 .参数 窗口ID, 整数型
 .参数 数据, 文本型
 
-Jade_公共_显示主窗口 ()
+Jade_内部_显示主窗口 ()
 )EPL";
     }
     if (options.tray) {
         // Only a ready tray can replace the page's minimize action with hiding.
-        replace(L"JadeView.窗口.最小化 (窗口ID)", LR"EPL(.如果真 (窗口ID ＝ Jade_公共_读状态 (Jade_公共_主窗口ID) 且 Jade_公共_读状态 (Jade_公共_托盘就绪) ≠ 0)
+        replace(L"JadeView.窗口.最小化 (窗口ID)", LR"EPL(.如果真 (窗口ID ＝ Jade_内部_读状态 (Jade_内部_主窗口ID) 且 Jade_内部_读状态 (Jade_内部_托盘就绪) ≠ 0)
     .如果真 (JadeView.窗口.设置窗口显示或隐藏 (窗口ID, 假))
         返回 (0)
     .如果真结束
 .如果真结束
 JadeView.窗口.最小化 (窗口ID))EPL");
-        replace(L"    Jade_公共_创建主窗口 ()", L"    Jade_公共_创建主窗口 ()\n    .如果真 (Jade_公共_读状态 (Jade_公共_退出中) ＝ 0)\n        .如果真 (Jade_公共_注册托盘事件 ())\n            Jade_公共_创建托盘 ()\n        .如果真结束\n    .如果真结束");
+        replace(L"    Jade_公共_创建主窗口 ()", L"    Jade_公共_创建主窗口 ()\n    .如果真 (Jade_内部_读状态 (Jade_内部_退出中) ＝ 0)\n        .如果真 (Jade_内部_注册托盘事件 ())\n            Jade_内部_创建托盘 ()\n        .如果真结束\n    .如果真结束");
         s += TraySource;
     } else {
-        s += L"\n.子程序 Jade_公共_清理托盘\n\n";
+        s += L"\n.子程序 Jade_内部_清理托盘\n\n";
     }
     return s;
 }

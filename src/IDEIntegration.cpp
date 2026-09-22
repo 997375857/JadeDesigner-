@@ -25,6 +25,9 @@ struct IntegrationState {
     HWND codeTab = nullptr;
     bool mainSubclassed = false;
     bool attached = false;
+    bool wpeProbeInitialized = false;
+    bool wpeDetected = false;
+    std::string wpeReason;
 };
 
 IntegrationState g_state;
@@ -53,6 +56,32 @@ HWND FindDirectChild(HWND parent, int controlId, const wchar_t* expectedClass)
 
 bool TryAttach()
 {
+    std::string wpeReason;
+    const bool wpeDetected = WebPreview::IsCurrentProjectWpe(g_state.mainWindow, &wpeReason);
+    const bool runtimeChanged = g_state.wpeProbeInitialized && g_state.wpeDetected != wpeDetected;
+    if (!g_state.wpeProbeInitialized || g_state.wpeDetected != wpeDetected ||
+        g_state.wpeReason != wpeReason) {
+        DesignerLog::Write(
+            "IDE WPE detect=" + std::to_string(wpeDetected ? 1 : 0) +
+            " reason=" + wpeReason +
+            " takeover=" + std::to_string(wpeDetected ? 1 : 0));
+        g_state.wpeProbeInitialized = true;
+        g_state.wpeDetected = wpeDetected;
+        g_state.wpeReason = wpeReason;
+    }
+    if (runtimeChanged && g_state.attached) {
+        WebPreview::Shutdown();
+        g_state.attached = false;
+    }
+    // Saved native projects get an opt-in design tab, never property takeover.
+    if (wpeReason == "project_path_missing" || wpeReason == "main_window_invalid") {
+        if (g_state.attached || WebPreview::IsAttached()) {
+            WebPreview::Shutdown();
+            g_state.attached = false;
+            DesignerLog::Write("IDE WPE not detected; Jade takeover released");
+        }
+        return false;
+    }
     if (g_state.attached) {
         if (WebPreview::IsAttached()) {
             WebPreview::Layout();
@@ -74,7 +103,7 @@ bool TryAttach()
 
     g_state.codeTab = codeTab;
     g_state.mdiClient = mdiClient;
-    g_state.attached = WebPreview::Attach(g_state.mainWindow, mdiClient, codeTab);
+    g_state.attached = WebPreview::Attach(g_state.mainWindow, mdiClient, codeTab, wpeDetected);
     if (g_state.attached) {
         DesignerLog::Write(
             "IDE target attached code_tab=" + DesignerLog::HexPointer(codeTab) +
@@ -200,6 +229,9 @@ void Stop()
     g_state.mdiClient = nullptr;
     g_state.codeTab = nullptr;
     g_state.attached = false;
+    g_state.wpeProbeInitialized = false;
+    g_state.wpeDetected = false;
+    g_state.wpeReason.clear();
     DesignerLog::Write("IDE integration stopped");
 }
 

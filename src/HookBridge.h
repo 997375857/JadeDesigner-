@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace HookBridge {
 
@@ -34,6 +35,10 @@ HostInfo InspectHost();
 // 1: unique assembly read; 0: proven absent; -1: unavailable/ambiguous.
 int ReadAssembly(const std::string& nameAnsi, std::string& sourceUtf8, std::string& error);
 int ReadRoutine(const std::string& nameAnsi, std::string& sourceUtf8, std::string& error);
+// Reads every assembly name directly from the IDE memory model. This remains
+// usable while the corresponding code page is closed or the project tree is
+// waiting for a repaint.
+std::vector<std::wstring> ListAssemblyNames(std::string& error);
 
 bool GenerateAssembly(
     const std::string& assemblyAnsi,

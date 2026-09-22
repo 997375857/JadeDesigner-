@@ -3,15 +3,20 @@
 #include "DesignerLog.h"
 #include "IdeEventRouter.h"
 #include "ProjectAssembly.h"
+#include "ProjectWebDetection.h"
 #include "DesignerText.h"
 #include "DesignerVisual.h"
 #include "NativeToolbox.h"
+#include "NativeVisualDock.h"
 #include "NativeDiagnosticsDock.h"
 #include "HookBridge.h"
 #include "DesignerInspection.h"
 #include "DesignerToolsScript.h"
 #include "RuntimeDiagnosticsScript.h"
 #include "DiagnosticsInstall.h"
+#include "DesignWorkspaceScript.h"
+#include "DesignWorkspaceStore.h"
+#include "DesignNavigation.h"
 
 #include <CommCtrl.h>
 #include <Shlwapi.h>
@@ -20,6 +25,7 @@
 #include <wrl.h>
 
 #include <cwchar>
+#include <cwctype>
 #include <algorithm>
 #include <cmath>
 #include <exception>
@@ -28,25 +34,29 @@
 #include <new>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
+#include <map>
 
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr char kHostClassName[] = "JadeDesigner.PreviewMdiChild";
+constexpr char kHostClassName[] = "JadeDesigner.PreviewOverlay";
 constexpr wchar_t kCompatTabClassName[] = L"JadeDesigner.CompatCodeTab";
 constexpr wchar_t kTabText[] = L"Jade预览";
 constexpr UINT_PTR kRefreshTimerId = 0x4A44;
+constexpr UINT_PTR kCodeTabSubclassId = 0x4A445441;
+constexpr UINT_PTR kMdiClientSubclassId = 0x4A444D44;
 constexpr UINT kRefreshIntervalMs = 600;
-constexpr UINT kMaximizeDocumentMessage = WM_APP + 0x4A4;
 // WebView2 invokes WebMessageReceived while its controller is still inside
 // the browser callback. Editing/activating an e5.95 MDI page from that callback
 // can re-enter the preview and crash the IDE. Queue the event to the native
 // preview window and handle it after the WebView callback returns.
 constexpr UINT kRouteUiEventMessage = WM_APP + 0x4A5;
 constexpr UINT kNativeToolboxMessage = WM_APP + 0x4A6;
+constexpr UINT kDesignPageMessage = WM_APP + 0x4A7;
 
 struct PreviewState {
     HMODULE module = nullptr;
@@ -55,20 +65,26 @@ struct PreviewState {
     HWND codeTab = nullptr;
     HWND hostWindow = nullptr;
     HWND compatTabWindow = nullptr;
-    HWND tabMessageTarget = nullptr;
+    HWND designTabWindow = nullptr;
+    bool runtimeEnabled = true;
+    bool designWorkspace = false;
+    bool designSourcePage = false;
+    bool designLoaded = false;
+    bool designNavigationPending = false;
+    std::wstring designNavigationUri;
+    std::wstring designProject, designToken;
+    std::string designBytes, designTaskBytes;
     HFONT compatTabFont = nullptr;
     bool classesReady = false;
+    bool codeTabSubclassed = false;
+    bool mdiClientSubclassed = false;
     bool active = false;
     bool webViewStarting = false;
     bool comAttempted = false;
     bool comNeedsUninitialize = false;
     bool currentPageIsFile = false;
     bool lastWriteValid = false;
-    bool maximizingDocument = false;
     bool compatTabHover = false;
-    bool tabCaptionEverUpdated = false;
-    int codeTabIndex = -1;
-    unsigned int tabCaptionUpdateAttempts = 0;
     std::wstring indexPath;
     FILETIME lastWrite{};
     bool fitPending = false;
@@ -87,9 +103,12 @@ struct PreviewState {
 };
 
 PreviewState g_state;
+std::map<std::wstring,std::string> g_designDrafts;
 NativeToolbox g_nativeToolbox;
-NativeDiagnosticsDock g_nativeDiagnostics;
+NativeVisualDock g_nativeVisualDock;
+NativeDiagnosticsDock g_nativeDiagnosticsDock;
 bool g_visualDesignMode = false;
+bool g_controlEventsEnabled = false;
 
 struct PendingUiEvent {
     unsigned long long generation = 0;
@@ -104,6 +123,289 @@ DesignerText::Document g_textDocument;
 IdeEventRouter::CommonPreview g_commonPreview;
 unsigned g_commonPreviewRevision = 0;
 std::wstring g_commonPreviewProject;
+
+std::string HResultText(HRESULT value);
+std::wstring DirectoryOf(const std::wstring& path);
+bool ResolveProjectWebIndex(std::wstring& result);
+bool ReadWebDirLatestWrite(const std::wstring& webDir, FILETIME& result);
+void ResizeController();
+void NavigateConfiguredPage();
+
+std::wstring TrimCopy(std::wstring value)
+{
+    while (!value.empty() && std::iswspace(value.front())) value.erase(value.begin());
+    while (!value.empty() && std::iswspace(value.back())) value.pop_back();
+    return value;
+}
+
+std::wstring JavaScriptString(std::wstring_view value)
+{
+    constexpr wchar_t hex[] = L"0123456789abcdef";
+    std::wstring out = L"\"";
+    for (const wchar_t c : value) {
+        switch (c) {
+        case L'\\': out += L"\\\\"; break;
+        case L'\"': out += L"\\\""; break;
+        case L'\r': out += L"\\r"; break;
+        case L'\n': out += L"\\n"; break;
+        case L'\t': out += L"\\t"; break;
+        default:
+            if (c < 0x20) {
+                out += L"\\u00";
+                out += hex[(c >> 4) & 0xf];
+                out += hex[c & 0xf];
+            } else {
+                out += c;
+            }
+            break;
+        }
+    }
+    out += L'\"';
+    return out;
+}
+
+bool FindTagById(std::wstring_view source, std::wstring_view id, DesignerVisual::Tag& result)
+{
+    if (id.empty() || id.size() > 512) return false;
+    bool found = false;
+    for (size_t p = 0; p < source.size();) {
+        if (source[p] != L'<') { ++p; continue; }
+        if (source.substr(p, 4) == L"<!--") {
+            const auto end = source.find(L"-->", p + 4);
+            if (end == source.npos) return false;
+            p = end + 3;
+            continue;
+        }
+        DesignerVisual::Tag tag;
+        if (!DesignerVisual::ParseTag(source, p, tag)) { ++p; continue; }
+        if (!tag.closing) {
+            for (const auto& attribute : tag.attrs) {
+                if ((attribute.name == L"id" || attribute.name == L"data-jade-id") &&
+                    source.substr(attribute.valueStart, attribute.valueEnd - attribute.valueStart) == id) {
+                    if (found) return false;
+                    result = tag;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        p = tag.end;
+    }
+    return found;
+}
+
+bool FindDirectTextRange(std::wstring_view source, const DesignerVisual::Tag& root,
+    size_t& start, size_t& end)
+{
+    if (root.self || DesignerVisual::Void(root.name) || root.end >= source.size()) return false;
+    int depth = 1;
+    size_t p = root.end;
+    while (p < source.size()) {
+        if (source[p] != L'<') {
+            const size_t next = source.find(L'<', p);
+            const size_t stop = next == source.npos ? source.size() : next;
+            if (depth == 1) {
+                size_t a = p, b = stop;
+                while (a < b && std::iswspace(source[a])) ++a;
+                while (b > a && std::iswspace(source[b - 1])) --b;
+                if (a < b) { start = a; end = b; return true; }
+            }
+            p = stop;
+            continue;
+        }
+        if (source.substr(p, 4) == L"<!--") {
+            const auto commentEnd = source.find(L"-->", p + 4);
+            if (commentEnd == source.npos) return false;
+            p = commentEnd + 3;
+            continue;
+        }
+        DesignerVisual::Tag tag;
+        if (!DesignerVisual::ParseTag(source, p, tag)) return false;
+        if (tag.closing) {
+            if (depth == 1 && tag.name == root.name) return false;
+            --depth;
+            if (depth <= 0) return false;
+        } else if (!tag.self && !DesignerVisual::Void(tag.name)) {
+            ++depth;
+            if (DesignerVisual::Raw(tag.name)) {
+                const auto close = source.find(L"</" + tag.name, tag.end);
+                if (close == source.npos) return false;
+                p = close;
+                continue;
+            }
+        }
+        p = tag.end;
+    }
+    return false;
+}
+
+bool StyleHasProperty(std::wstring_view style, std::wstring_view property)
+{
+    size_t p = 0;
+    while (p < style.size()) {
+        const auto semi = style.find(L';', p);
+        const auto stop = semi == style.npos ? style.size() : semi;
+        const auto colon = style.find(L':', p);
+        if (colon != style.npos && colon < stop) {
+            auto name = TrimCopy(std::wstring(style.substr(p, colon - p)));
+            for (auto& c : name) c = static_cast<wchar_t>(std::towlower(c));
+            if (name == property) return true;
+        }
+        p = semi == style.npos ? style.size() : semi + 1;
+    }
+    return false;
+}
+
+bool ParsePixelValue(const std::wstring& raw, const std::wstring& key, std::wstring& normalized,
+    std::string& error)
+{
+    auto value = TrimCopy(raw);
+    if (value.size() >= 2 && value.ends_with(L"px")) value.resize(value.size() - 2);
+    value = TrimCopy(value);
+    if (value.empty() || value.size() > 8) { error = "请输入像素整数，例如 120"; return false; }
+    const size_t sign = value[0] == L'-' ? 1 : 0;
+    if (sign == value.size() || value.find_first_not_of(L"0123456789", sign) != value.npos) {
+        error = "位置和尺寸只支持像素整数"; return false;
+    }
+    long number = 0;
+    try { number = std::stol(value); } catch (...) { error = "像素值超出范围"; return false; }
+    const long minimum = key == L"left" || key == L"top" ? -4000 : 0;
+    if (number < minimum || number > 4000) { error = "像素值必须在允许范围内"; return false; }
+    normalized = std::to_wstring(number) + L"px";
+    return true;
+}
+
+bool ApplyNativeVisualEdit(const NativeVisualDock::Selection& selection,
+    const std::wstring& key, const std::wstring& rawValue)
+{
+    if (selection.id.empty() || (key != L"text" && key != L"left" && key != L"top" &&
+        key != L"width" && key != L"height")) return false;
+    if (g_state.indexPath.empty()) return false;
+    std::wstring resolved;
+    if (!ResolveProjectWebIndex(resolved) || _wcsicmp(resolved.c_str(), g_state.indexPath.c_str()) != 0) {
+        DesignerLog::Write("PREVIEW native_property_edit rejected reason=page_not_project_html");
+        return false;
+    }
+    std::string error;
+    if (!g_textDocument.Open(resolved, error)) {
+        DesignerLog::Write("PREVIEW native_property_edit rejected reason=" + error);
+        return false;
+    }
+    const auto source = DesignerText::Wide(g_textDocument.bytes);
+    DesignerVisual::Tag tag;
+    if (!FindTagById(source, selection.id, tag)) {
+        DesignerLog::Write("PREVIEW native_property_edit rejected reason=id_not_unique id=" +
+            DesignerLog::ToUtf8(selection.id));
+        return false;
+    }
+
+    std::vector<DesignerVisual::Edit> edits;
+    std::wstring runtimeValue = rawValue;
+    if (key == L"text") {
+        size_t textStart = 0, textEnd = 0;
+        if (!FindDirectTextRange(source, tag, textStart, textEnd)) {
+            DesignerLog::Write("PREVIEW native_property_edit rejected reason=no_direct_text id=" +
+                DesignerLog::ToUtf8(selection.id));
+            return false;
+        }
+        edits.push_back({L"text", textStart, textEnd, source.substr(textStart, textEnd - textStart), rawValue, rawValue});
+    } else {
+        if (!ParsePixelValue(rawValue, key, runtimeValue, error)) {
+            DesignerLog::Write("PREVIEW native_property_edit rejected reason=" + error);
+            return false;
+        }
+        const auto styleEdit = [&](const std::wstring& property, const std::wstring& value) {
+            edits.push_back({L"style", tag.start, tag.end, source.substr(tag.start, tag.end - tag.start), property, value});
+        };
+        if (key == L"left" || key == L"top") {
+            std::wstring style;
+            for (const auto& attribute : tag.attrs) if (attribute.name == L"style")
+                style = source.substr(attribute.valueStart, attribute.valueEnd - attribute.valueStart);
+            if (!StyleHasProperty(style, L"position")) styleEdit(L"position", L"relative");
+        }
+        styleEdit(key, runtimeValue);
+    }
+    if (!DesignerVisual::Save(g_textDocument, g_textDocument.revision, edits, error)) {
+        DesignerLog::Write("PREVIEW native_property_edit rejected reason=" + error);
+        return false;
+    }
+    ReadWebDirLatestWrite(DirectoryOf(g_state.indexPath), g_state.lastWrite);
+    g_state.lastWriteValid = true;
+
+    if (g_state.webView) {
+        const auto id = JavaScriptString(selection.id);
+        const auto value = JavaScriptString(key == L"text" ? rawValue : runtimeValue);
+        std::wstring script = L"(() => { const wanted=" + id +
+            L"; const e=document.getElementById(wanted)||[...document.querySelectorAll('[data-jade-id]')].find(x=>x.dataset.jadeId===wanted); if(!e) return false; ";
+        if (key == L"text") {
+            script += L"const n=[...e.childNodes].find(n=>n.nodeType===3&&n.textContent.trim()); if(n)n.textContent=" + value +
+                L";else e.appendChild(document.createTextNode(" + value + L"));";
+        } else {
+            script += L"e.style.setProperty(" + JavaScriptString(key) + L"," + value + L",'important');";
+            if (key == L"left" || key == L"top") script += L"e.style.setProperty('position','relative','important');";
+        }
+        script += L" return true; })()";
+        const HRESULT executeResult = g_state.webView->ExecuteScript(script.c_str(), nullptr);
+        DesignerLog::Write("PREVIEW native_property_edit key=" + DesignerLog::ToUtf8(key) +
+            " id=" + DesignerLog::ToUtf8(selection.id) + " value=" +
+            DesignerLog::ToUtf8(key == L"text" ? rawValue : runtimeValue) +
+            " execute_hr=" + HResultText(executeResult));
+    }
+    return true;
+}
+
+// The native 属性 page uses the same binding pipeline as the injected Jade
+// tools. This keeps “double-click event” behavior identical in both places:
+// inspect first, create only when missing, then jump to the resulting routine.
+IdeEventRouter::RouteResult OperateControlEvent(IdeEventRouter::UiEvent event)
+{
+    std::wstring resolved;
+    if(!g_controlEventsEnabled)return {false,"readonly","预览模式不创建或跳转事件，请切换到事件或设计模式"};
+    if(!ResolveProjectWebIndex(resolved)||_wcsicmp(resolved.c_str(),g_state.indexPath.c_str())!=0)
+        return {false,"stale","工程或网页已变化，请重新选择控件"};
+    std::string error;
+    if(!IdeEventRouter::NormalizeControlEvent(event,error))return {false,"invalid_event",error};
+    auto result=IdeEventRouter::OperateBinding(g_state.mainWindow,g_state.mdiClient,event,false);
+    if(!result.succeeded)return result;
+    const auto located=IdeEventRouter::OperateBinding(g_state.mainWindow,g_state.mdiClient,event,true);
+    if(!located.succeeded) {
+        // A successful background write must not be reported as a failed write
+        // merely because the IDE is still rebuilding its program tree.
+        if(result.action=="list_binding_created") {
+            result.message+="；代码已生成并核验，"+located.message;
+            return result;
+        }
+        return {false,"locate",result.message+"；"+located.message};
+    }
+    result.message+="；已定位回调";
+    WebPreview::Hide();
+    return result;
+}
+
+std::wstring OperateNativeVisualEvent(const NativeVisualDock::Selection& selection,
+    const std::wstring& eventName, const std::string& eventCode)
+{
+    if(selection.documentGeneration!=g_state.documentGeneration||selection.id.empty())
+        return L"选择已失效或控件 ID 不唯一，请重新选择控件";
+    IdeEventRouter::UiEvent event;
+    event.domEvent = eventCode;
+    event.controlType = DesignerText::Utf8(selection.type);
+    if (selection.type == L"list") event.controlType = "super-list";
+    event.elementId = DesignerText::Utf8(selection.id);
+    event.handlerName = DesignerText::Utf8(selection.handler);
+    event.assemblyName = DesignerText::Utf8(selection.assembly);
+    event.callType = selection.call.empty()
+        ? "JadeView.通讯.订阅"
+        : DesignerText::Utf8(selection.call);
+    event.callParam = DesignerText::Utf8(selection.channel);
+    const auto result = OperateControlEvent(event);
+    DesignerLog::Write(
+        "PREVIEW native_event name=" + DesignerLog::ToUtf8(eventName) +
+        " code=" + eventCode + " id=" + event.elementId +
+        " action=" + result.action + " ok=" + (result.succeeded ? "1" : "0") +
+        " message=" + result.message);
+    return DesignerText::Wide(result.succeeded ? result.message : "事件操作失败：" + result.message);
+}
 
 int MeasureTextWidth(HDC dc, const wchar_t* text, int length)
 {
@@ -131,7 +433,8 @@ void PaintCompatTab(HWND window)
     HDC dc = BeginPaint(window, &paint);
     RECT rect{};
     GetClientRect(window, &rect);
-    const bool active = WebPreview::IsActive();
+    const bool isDesign = window == g_state.designTabWindow;
+    const bool active = WebPreview::IsActive() && (g_state.designWorkspace || g_state.designSourcePage) == isDesign;
     const COLORREF background = active
         ? RGB(255, 244, 244)
         : (g_state.compatTabHover ? RGB(255, 232, 232) : RGB(240, 240, 240));
@@ -150,7 +453,7 @@ void PaintCompatTab(HWND window)
     SetTextColor(dc, active ? RGB(238, 0, 0) : RGB(205, 0, 0));
     HFONT font = EnsureCompatTabFont();
     HFONT previousFont = static_cast<HFONT>(SelectObject(dc, font));
-    DrawTextW(dc, kTabText, -1, &rect,
+    DrawTextW(dc, isDesign ? L"Jade设计" : kTabText, -1, &rect,
               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(dc, previousFont);
 
@@ -199,7 +502,14 @@ LRESULT CALLBACK CompatTabWindowProc(
         RECT rect{};
         GetClientRect(window, &rect);
         if (PtInRect(&rect, point)) {
-            WebPreview::Show();
+            if(window == g_state.designTabWindow) WebPreview::ShowDesign();
+            else {
+                const bool switching = g_state.designWorkspace || g_state.designSourcePage;
+                g_state.designWorkspace = false;
+                g_state.designSourcePage = false;
+                if(switching) NavigateConfiguredPage();
+                WebPreview::Show();
+            }
         }
         return 0;
     }
@@ -207,6 +517,7 @@ LRESULT CALLBACK CompatTabWindowProc(
         SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));
         return TRUE;
     case WM_NCDESTROY:
+        if(g_state.designTabWindow == window) g_state.designTabWindow = nullptr;
         if (g_state.compatTabWindow == window) {
             g_state.compatTabWindow = nullptr;
         }
@@ -246,11 +557,6 @@ void UpdateCompatTabLayout()
         g_state.codeTab == nullptr || !IsWindow(g_state.codeTab)) {
         return;
     }
-    if (g_state.tabCaptionEverUpdated) {
-        ShowWindow(g_state.compatTabWindow, SW_HIDE);
-        return;
-    }
-
     RECT client{};
     GetClientRect(g_state.codeTab, &client);
     if (client.right <= 0 || client.bottom <= 0) {
@@ -270,7 +576,7 @@ void UpdateCompatTabLayout()
     ReleaseDC(g_state.codeTab, dc);
 
     const int width = textWidth + 30;
-    const int maximumLeft = client.right - width - 4;
+    const int maximumLeft = client.right - width * (g_state.runtimeEnabled ? 2 : 1) - 4;
     if (left > maximumLeft) {
         left = maximumLeft;
     }
@@ -279,7 +585,12 @@ void UpdateCompatTabLayout()
     }
     SetWindowPos(
         g_state.compatTabWindow, HWND_TOP, left, 0, width, client.bottom,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SWP_NOACTIVATE | (g_state.runtimeEnabled ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+    if(g_state.designTabWindow) {
+        SetWindowPos(g_state.designTabWindow, HWND_TOP, left + (g_state.runtimeEnabled ? width : 0),
+            0, width, client.bottom, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(g_state.designTabWindow, nullptr, FALSE);
+    }
     InvalidateRect(g_state.compatTabWindow, nullptr, FALSE);
 }
 
@@ -299,167 +610,13 @@ bool EnsureCompatTabWindow()
             std::to_string(GetLastError()));
         return false;
     }
+    g_state.designTabWindow = CreateWindowExW(0,kCompatTabClassName,L"Jade设计",
+        WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS,0,0,90,18,g_state.codeTab,nullptr,g_state.module,nullptr);
     DesignerLog::Write(
         "PREVIEW compatibility tab created hwnd=" +
         DesignerLog::HexPointer(g_state.compatTabWindow));
     UpdateCompatTabLayout();
     return true;
-}
-
-int QueryCodeTabCount(HWND messageTarget)
-{
-    if (messageTarget == nullptr || !IsWindow(messageTarget)) {
-        return -1;
-    }
-    const LRESULT countResult = SendMessageW(
-        messageTarget, TCM_GETITEMCOUNT, 0, 0);
-    if (countResult < 0 || countResult > 4096) {
-        return -1;
-    }
-    return static_cast<int>(countResult);
-}
-
-void CaptureCodeTabInsertionPoint()
-{
-    g_state.tabMessageTarget = nullptr;
-    g_state.codeTabIndex = -1;
-    const HWND targets[] = {g_state.mainWindow, g_state.codeTab};
-    for (const HWND target : targets) {
-        const int count = QueryCodeTabCount(target);
-        if (count <= 0) {
-            continue;
-        }
-        g_state.tabMessageTarget = target;
-        g_state.codeTabIndex = count;
-        DesignerLog::Write(
-            "PREVIEW code_tab_insertion_point target=" +
-            DesignerLog::HexPointer(target) +
-            " index=" + std::to_string(count));
-        return;
-    }
-}
-
-bool SetCodeTabCaptionAt(HWND messageTarget, int index, const char* route)
-{
-    if (g_state.hostWindow == nullptr || !IsWindow(g_state.hostWindow) ||
-        index < 0 || QueryCodeTabCount(messageTarget) <= index) {
-        return false;
-    }
-
-    TCITEMW updated{};
-    updated.mask = TCIF_TEXT | TCIF_PARAM;
-    updated.pszText = const_cast<LPWSTR>(kTabText);
-    updated.lParam = reinterpret_cast<LPARAM>(g_state.hostWindow);
-    const bool succeeded = SendMessageW(
-        messageTarget, TCM_SETITEMW,
-        static_cast<WPARAM>(index),
-        reinterpret_cast<LPARAM>(&updated)) != 0;
-    if (!g_state.tabCaptionEverUpdated || !succeeded) {
-        DesignerLog::Write(
-            "PREVIEW native_code_tab_update route=" + std::string(route) +
-            " target=" + DesignerLog::HexPointer(messageTarget) +
-            " index=" + std::to_string(index) +
-            " success=" + std::to_string(succeeded ? 1 : 0));
-    }
-    return succeeded;
-}
-
-bool UpdateCodeTabCaptionOn(HWND messageTarget)
-{
-    if (messageTarget == nullptr || !IsWindow(messageTarget) ||
-        g_state.hostWindow == nullptr) {
-        return false;
-    }
-
-    const int count = QueryCodeTabCount(messageTarget);
-    if (count <= 0) {
-        return false;
-    }
-
-    for (int index = 0; index < count; ++index) {
-        TCITEMW current{};
-        current.mask = TCIF_PARAM;
-        if (SendMessageW(
-                messageTarget, TCM_GETITEMW,
-                static_cast<WPARAM>(index),
-                reinterpret_cast<LPARAM>(&current)) == 0) {
-            continue;
-        }
-        if (reinterpret_cast<HWND>(current.lParam) != g_state.hostWindow) {
-            continue;
-        }
-        return SetCodeTabCaptionAt(messageTarget, index, "matched_hwnd");
-    }
-    return false;
-}
-
-bool UpdateCodeTabCaption()
-{
-    // WM_MDICREATE appends the Jade document at the count captured just
-    // before creation. Updating that exact slot avoids relying on a themed
-    // tab implementation exposing its HWND through TCM_GETITEM.
-    if (g_state.tabMessageTarget != nullptr && g_state.codeTabIndex >= 0 &&
-        SetCodeTabCaptionAt(
-            g_state.tabMessageTarget, g_state.codeTabIndex,
-            "captured_index")) {
-        g_state.tabCaptionEverUpdated = true;
-        return true;
-    }
-
-    // The installed visual extension forwards the standard TCM_* messages
-    // from the IDE main window to its custom code-tab model. A plain tab
-    // implementation may accept the same messages on the tab HWND itself.
-    const bool updated = UpdateCodeTabCaptionOn(g_state.mainWindow) ||
-                         UpdateCodeTabCaptionOn(g_state.codeTab);
-    g_state.tabCaptionEverUpdated = g_state.tabCaptionEverUpdated || updated;
-    return updated;
-}
-
-void RetryCodeTabCaption()
-{
-    constexpr unsigned int kMaximumAttempts = 20;
-    if (g_state.tabCaptionUpdateAttempts >= kMaximumAttempts) {
-        return;
-    }
-    ++g_state.tabCaptionUpdateAttempts;
-    const bool updated = UpdateCodeTabCaption();
-    if (!updated && g_state.tabCaptionUpdateAttempts == kMaximumAttempts) {
-        DesignerLog::Write(
-            "PREVIEW native_code_tab_update exhausted after 20 attempts");
-    }
-}
-
-void MaximizeMdiDocument(HWND documentWindow)
-{
-    if (g_state.maximizingDocument || documentWindow == nullptr ||
-        !IsWindow(documentWindow) || g_state.mdiClient == nullptr ||
-        !IsWindow(g_state.mdiClient) ||
-        GetParent(documentWindow) != g_state.mdiClient) {
-        return;
-    }
-
-    g_state.maximizingDocument = true;
-    ShowWindow(documentWindow, SW_SHOW);
-
-    // The current IDE visual layer intentionally swallows WM_MDIMAXIMIZE.
-    // Calling the registered system MDIClient class procedure preserves the
-    // native maximized-document layout without bypassing tab activation.
-    const auto mdiClassProcedure = reinterpret_cast<WNDPROC>(
-        GetClassLongPtrA(g_state.mdiClient, GCLP_WNDPROC));
-    if (mdiClassProcedure != nullptr) {
-        CallWindowProcA(
-            mdiClassProcedure, g_state.mdiClient, WM_MDIMAXIMIZE,
-            reinterpret_cast<WPARAM>(documentWindow), 0);
-    }
-    else {
-        ShowWindow(documentWindow, SW_MAXIMIZE);
-    }
-
-    DesignerLog::Write(
-        "PREVIEW maximize_document hwnd=" +
-        DesignerLog::HexPointer(documentWindow) +
-        " zoomed=" + std::to_string(IsZoomed(documentWindow) ? 1 : 0));
-    g_state.maximizingDocument = false;
 }
 
 std::string WideToAnsi(const wchar_t* value)
@@ -534,6 +691,70 @@ bool ExtractProjectPathFromTitle(const std::wstring& title, std::wstring& projec
             }
         }
     }
+    return false;
+}
+
+bool ReadFilePrefix(const std::wstring& path, std::string& content)
+{
+    content.clear();
+    const HANDLE file = CreateFileW(
+        path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
+        CloseHandle(file);
+        return false;
+    }
+    const DWORD toRead = static_cast<DWORD>(std::min<LONGLONG>(size.QuadPart, 512 * 1024));
+    content.resize(toRead);
+    DWORD read = 0;
+    const bool ok = ReadFile(file, content.data(), toRead, &read, nullptr) != FALSE;
+    CloseHandle(file);
+    if (!ok) {
+        content.clear();
+        return false;
+    }
+    content.resize(read);
+    return true;
+}
+
+bool DetectWpeIndex(HWND mainWindow, std::string& reason)
+{
+    reason.clear();
+    if (mainWindow == nullptr || !IsWindow(mainWindow)) {
+        reason = "main_window_invalid";
+        return false;
+    }
+    wchar_t title[1024]{};
+    GetWindowTextW(mainWindow, title, static_cast<int>(std::size(title)));
+    std::wstring projectPath;
+    if (wcsstr(title, L"[起始页]") != nullptr ||
+        !ExtractProjectPathFromTitle(title, projectPath)) {
+        reason = "project_path_missing";
+        return false;
+    }
+    const std::wstring indexPath = DirectoryOf(projectPath) + L"\\web\\index.html";
+    // Detection failures must be logged even when no preview is ever attached.
+    DesignerLog::UseProjectFile(projectPath);
+    FILETIME unused{};
+    if (!ReadLastWriteTime(indexPath, unused)) {
+        reason = "web_index_missing";
+        return false;
+    }
+    std::string content;
+    if (!ReadFilePrefix(indexPath, content)) {
+        reason = "web_index_unreadable";
+        return false;
+    }
+    const auto marker = ProjectWebDetection::Marker(content);
+    if (!marker.empty()) {
+        reason = "marker=" + std::string(marker);
+        return true;
+    }
+    reason = "jade_marker_missing";
     return false;
 }
 
@@ -805,6 +1026,24 @@ void NavigateConfiguredPage()
         return;
     }
 
+    if(g_state.designWorkspace) {
+        ReadRecentProjectPath(g_state.designProject);
+        g_state.designBytes.clear();g_state.designTaskBytes.clear();g_state.designLoaded=false;
+        g_state.designToken=std::to_wstring(GetTickCount64())+L"-"+std::to_wstring(++g_state.documentGeneration);
+        g_state.currentPageIsFile=false;g_state.fitPending=false;
+        const auto html=L"<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            L"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            L"<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' https://jade-design-assets.invalid; img-src data: blob: https://jade-design-assets.invalid; font-src data: https://jade-design-assets.invalid; frame-src 'self' about:;\">"
+            L"<title>Jade设计</title></head><body><script>window.__jadeDesignToken="+
+            JavaScriptString(g_state.designToken)+L";"+DesignWorkspaceScript()+L"</script></body></html>";
+        g_state.designNavigationUri=DesignNavigation::InlineUri(html);
+        g_state.designNavigationPending=true;
+        const auto result=g_state.webView->NavigateToString(html.c_str());
+        if(FAILED(result))g_state.designNavigationPending=false;
+        DesignerLog::Write("DESIGN navigate hr="+HResultText(result));
+        return;
+    }
+
     RefreshResolvedIndex();
 
     FILETIME writeTime{};
@@ -866,6 +1105,14 @@ void PollFileChanges()
     if (!g_state.webView) {
         return;
     }
+    if(g_state.designWorkspace || g_state.designSourcePage) {
+        std::wstring project;
+        if(ReadRecentProjectPath(project) && project!=g_state.designProject) {
+            g_state.designSourcePage=false;g_state.designWorkspace=true;
+            NavigateConfiguredPage();return;
+        }
+        if(g_state.designWorkspace)return;
+    }
 
     if (g_state.fitPending) {
         g_state.fitPending = false;
@@ -915,6 +1162,7 @@ void InstallUiEventBridge()
   const encode = value => encodeURIComponent(String(value ?? ''));
   window.__jadeDesignerPreview = true;
   let toolsObserve = (element,wire) => wire;
+  let toolsCaptureInvoke = original => original;
   let toolsIgnored = () => {};
   // Icon-only buttons (<button onclick="closeWindow()"><i class="fa fa-times"></i></button>)
   // have no id, no name and no text, so there is nothing stable to name a
@@ -982,7 +1230,7 @@ void InstallUiEventBridge()
     const captured = function (...args) {
       window.__jadeLastChannel = String(args[0] || '');
       window.__jadeLastPayload = args.length > 1 ? args[1] : undefined;
-      return original.apply(this, args);
+      return toolsCaptureInvoke(original).apply(this, args);
     };
     try {
       Object.defineProperty(captured, '__jadeDesignerCapture', { value: true });
@@ -1045,11 +1293,6 @@ void InstallUiEventBridge()
     } catch (error) {
       payload = '[参数不可序列化]';
     }
-    // The native 工作夹 page is the communication inspector. Keep its row
-    // focused on the exact payload the page sent, independently of whether
-    // the generator later creates, locates, or rejects a callback.
-    window.chrome.webview.postMessage(
-      'JADE_DOCK_TRACE\t' + fields.map(encode).join('\t') + '\t' + encode(payload));
     // 模拟调试只展示“将要交给易语言”的内容，不进入原生事件生成链路。
     // payload 来自页面本次点击中同步调用的 jade.invoke。
     // Preview mode is read-only for code generation, but it must still expose
@@ -1226,7 +1469,9 @@ void InstallUiEventBridge()
   return 'installed';
 })()
 )JS";
-    const HRESULT result = g_state.webView->ExecuteScript(script.c_str(), nullptr);
+    const auto initializedScript = std::wstring(g_state.designSourcePage
+        ? L"window.__jadeSourceDesign=true;" : L"window.__jadeSourceDesign=false;") + script;
+    const HRESULT result = g_state.webView->ExecuteScript(initializedScript.c_str(), nullptr);
     DesignerLog::Write("PREVIEW install_ui_event_bridge hr=" + HResultText(result));
 }
 
@@ -1315,15 +1560,95 @@ void ProcessDesignerTool(const std::wstring& wire)
         if(g_state.webView) g_state.webView->PostWebMessageAsString(out.c_str());
     };
     try {
+        if(action==L"design_workspace"&&fields.size()==3&&g_state.designSourcePage) {
+            std::wstring current;
+            if(!ReadRecentProjectPath(current)||current!=g_state.designProject) {
+                reply(false,{"工程已切换，请重新打开设计"});return;
+            }
+            if(!PostMessageW(g_state.hostWindow,kDesignPageMessage,0,static_cast<LPARAM>(g_state.documentGeneration))) {
+                reply(false,{"无法切换设计页面"});return;
+            }
+            reply(true,{"返回设计稿"});return;
+        }
+        if(action.starts_with(L"design_")) {
+            std::wstring current;
+            if(!g_state.designWorkspace || fields.size()<4 || fields[3]!=g_state.designToken ||
+                !ReadRecentProjectPath(current) || current!=g_state.designProject) {
+                reply(false,{"设计页已切换，请重新打开"});return;
+            }
+            std::string error;
+            if(action==L"design_edit_source"&&fields.size()==4) {
+                const auto path=DirectoryOf(current)+L"\\web\\index.html";
+                const auto attributes=GetFileAttributesW(path.c_str());
+                if(!g_state.designLoaded||attributes==INVALID_FILE_ATTRIBUTES||
+                    (attributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT))) {
+                    reply(false,{"当前工程没有可编辑的 Jade web/index.html，请先生成网页并重新打开工程"});return;
+                }
+                std::string html;
+                const auto h=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+                if(h==INVALID_HANDLE_VALUE){reply(false,{"无法读取当前网页"});return;}
+                const bool readable=DesignerText::AtExpectedPath(h,path)&&DesignerText::ReadHandle(h,html);
+                CloseHandle(h);
+                if(!readable){reply(false,{"当前网页路径或内容无效"});return;}
+                ComPtr<ICoreWebView2_3> resources;
+                if(FAILED(g_state.webView.As(&resources))||!resources||
+                    FAILED(resources->SetVirtualHostNameToFolderMapping(L"jade-design-assets.invalid",
+                        (DirectoryOf(current)+L"\\web").c_str(),COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW))) {
+                    reply(false,{"无法载入网页本地样式和图片，请检查 WebView2 运行环境"});return;
+                }
+                reply(true,{html,"https://jade-design-assets.invalid/"});return;
+            }
+            if(action==L"design_load"&&fields.size()==4) {
+                if(!DesignWorkspaceStore::Read(DesignWorkspaceStore::Path(current),g_state.designBytes,error)||
+                    !DesignWorkspaceStore::Read(DesignWorkspaceStore::Path(current,true),g_state.designTaskBytes,error)) {
+                    reply(false,{error});return;
+                }
+                std::string html;
+                const auto path=DirectoryOf(current)+L"\\web\\index.html";
+                const auto h=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+                if(h!=INVALID_HANDLE_VALUE){
+                    if(!DesignerText::AtExpectedPath(h,path)||!DesignerText::ReadHandle(h,html))html.clear();
+                    CloseHandle(h);
+                }
+                g_state.designLoaded=true;
+                reply(true,{g_state.designBytes,html,DesignerText::Utf8(current),g_designDrafts[current]});return;
+            }
+            if((action==L"design_save"||action==L"design_export")&&fields.size()==5) {
+                if(!g_state.designLoaded){reply(false,{"请先读取设计稿"});return;}
+                const bool task=action==L"design_export";
+                auto& expected=task?g_state.designTaskBytes:g_state.designBytes;
+                const auto next=DesignerText::Utf8(fields[4]);
+                if(!DesignWorkspaceStore::Save(DesignWorkspaceStore::Path(current,task),expected,next,error)) {
+                    reply(false,{error});return;
+                }
+                expected=next;reply(true,{"已保存"});return;
+            }
+            reply(false,{"不支持的设计操作"});return;
+        }
+        if(g_state.designWorkspace){reply(false,{"设计稿不执行预览页操作"});return;}
         if(action==L"visual_toolbox"&&fields.size()==5) {
             if((fields[3]!=L"design"&&fields[3]!=L"event"&&fields[3]!=L"preview") ||
                 (fields[4]!=L"1"&&fields[4]!=L"0")){reply(false,{"无效的组件箱设置"});return;}
             g_visualDesignMode=fields[3]==L"design";
+            g_controlEventsEnabled=fields[3]!=L"preview";
+            g_nativeVisualDock.SetEventsEnabled(g_controlEventsEnabled);
             std::wstring error;
             g_nativeToolbox.SetEditable(g_visualDesignMode);
             const bool ready=g_nativeToolbox.Configure(fields[4]==L"1",WebPreview::IsActive(),error);
             DesignerLog::Write("PREVIEW native_toolbox enabled="+std::string(fields[4]==L"1"?"1":"0")+" ready="+(ready?"1":"0")+" floating="+(g_nativeToolbox.IsFloating()?"1":"0"));
             reply(ready,{ready?"组件箱设置已应用":DesignerText::Utf8(error)});
+        } else if(action==L"control_event"&&fields.size()==10) {
+            IdeEventRouter::UiEvent event;
+            event.controlType=DesignerText::Utf8(fields[3]);event.elementId=DesignerText::Utf8(fields[4]);
+            event.domEvent=DesignerText::Utf8(fields[5]);event.handlerName=DesignerText::Utf8(fields[6]);
+            event.callParam=DesignerText::Utf8(fields[7]);event.callType=DesignerText::Utf8(fields[8]);
+            event.assemblyName=DesignerText::Utf8(fields[9]);
+            const auto result=OperateControlEvent(event);
+            DesignerLog::Write("PREVIEW control_event type="+event.controlType+" id="+event.elementId+
+                " code="+event.domEvent+" handler="+event.handlerName+
+                " channel="+event.callParam+" assembly="+event.assemblyName+
+                " action="+result.action+" message="+result.message);
+            reply(result.succeeded,{result.message});
         } else if(action==L"copy_description"&&fields.size()==4) {
             const auto& text=fields[3];
             if(text.empty()||text.size()>32768||text.find(L'\0')!=text.npos){reply(false,{"元素描述过长或内容无效"});return;}
@@ -1379,6 +1704,7 @@ void ProcessDesignerTool(const std::wstring& wire)
             const bool ok=DiagnosticsInstall::Install(resolved,RuntimeDiagnosticsScript(),message);
             reply(ok,{message});
         } else if((action==L"inspect" || action==L"repair" || action==L"locate") && fields.size()==4) {
+            if(action!=L"inspect"&&!g_controlEventsEnabled){reply(false,{"预览模式禁止创建或跳转事件"});return;}
             IdeEventRouter::UiEvent event;
             if(!IdeEventRouter::TryParseWebMessage(fields[3],event)) { reply(false,{"无效的控件信息"}); return; }
             if(action==L"inspect") {
@@ -1483,11 +1809,45 @@ HRESULT OnWebMessageReceived(
     const std::wstring sourceUrl=origin?origin:L"";
     if(origin) CoTaskMemFree(origin);
     const std::wstring expectedUrl=PathToUrl(g_state.indexPath);
-    if(FAILED(sourceResult) || !DesignerText::SameDocumentUrl(sourceUrl,expectedUrl)) return S_OK;
-    constexpr wchar_t dockPrefix[] = L"JADE_DOCK_TRACE\t";
-    if (wireMessage.starts_with(dockPrefix)) {
+    if(FAILED(sourceResult))return S_OK;
+    if(g_state.designWorkspace) {
+        if(sourceUrl!=L"about:blank")return S_OK;
+        // Draft messages only copy text into memory; no IDE reentry or file I/O.
+        // Handle before the queued command path so navigation cannot drop drafts.
+        if(wireMessage.starts_with(L"JADE_DESIGN_DRAFT\t")) {
+            const auto end=wireMessage.find(L'\t',18);
+            if(end==wireMessage.npos)return S_OK;
+            const auto token=wireMessage.substr(18,end-18);
+            std::wstring current;
+            if(token==g_state.designToken&&ReadRecentProjectPath(current)&&current==g_state.designProject) {
+                auto draft=IdeEventRouter::DecodeWireField(std::wstring_view(wireMessage).substr(end+1));
+                if(draft.empty())g_designDrafts.erase(current);
+                else if(draft.size()<=1024*1024)g_designDrafts[current]=std::move(draft);
+            }
+            return S_OK;
+        }
+        if(!wireMessage.starts_with(L"JADE_TOOL\t"))return S_OK;
+    } else if(!DesignerText::SameDocumentUrl(sourceUrl,expectedUrl))return S_OK;
+    if (wireMessage.starts_with(L"JADE_DOCK_TRACE\t")) {
+        std::vector<std::wstring> fields;
+        const auto body = std::wstring_view(wireMessage).substr(16);
+        for (size_t start = 0; start <= body.size();) {
+            const size_t end = body.find(L'\t', start);
+            const size_t stop = end == std::wstring_view::npos ? body.size() : end;
+            fields.push_back(DesignerText::Wide(IdeEventRouter::DecodeWireField(body.substr(start, stop - start))));
+            if (end == std::wstring_view::npos) break;
+            start = end + 1;
+        }
+        if (fields.size() == 8) {
+            g_nativeDiagnosticsDock.Add({std::to_wstring(g_state.documentGeneration) + L":" + fields[0],
+                fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7]});
+        }
+        return S_OK;
+    }
+    constexpr wchar_t selectionPrefix[] = L"JADE_VISUAL_SELECTION\t";
+    if (wireMessage.starts_with(selectionPrefix)) {
         std::vector<std::string> fields;
-        const auto body = std::wstring_view(wireMessage).substr(std::size(dockPrefix) - 1);
+        const auto body = std::wstring_view(wireMessage).substr(std::size(selectionPrefix) - 1);
         for (size_t start = 0; start <= body.size();) {
             const size_t end = body.find(L'\t', start);
             const size_t stop = end == std::wstring_view::npos ? body.size() : end;
@@ -1495,10 +1855,24 @@ HRESULT OnWebMessageReceived(
             if (end == std::wstring_view::npos) break;
             start = end + 1;
         }
-        if (fields.size() >= 10) {
-            g_nativeDiagnostics.Add(
-                DesignerText::Wide(fields[5]), DesignerText::Wide(fields[9]),
-                DesignerText::Wide(fields[6]));
+        if (fields.size() >= 7) {
+            NativeVisualDock::Selection selection{};
+            selection.type = DesignerText::Wide(fields[0]);
+            selection.id = DesignerText::Wide(fields[1]);
+            selection.text = DesignerText::Wide(fields[2]);
+            selection.handler = DesignerText::Wide(fields[3]);
+            selection.channel = DesignerText::Wide(fields[4]);
+            selection.call = DesignerText::Wide(fields[5]);
+            selection.assembly = DesignerText::Wide(fields[6]);
+            selection.left = fields.size() >= 8 ? DesignerText::Wide(fields[7]) : L"";
+            selection.top = fields.size() >= 9 ? DesignerText::Wide(fields[8]) : L"";
+            selection.width = fields.size() >= 10 ? DesignerText::Wide(fields[9]) : L"";
+            selection.height = fields.size() >= 11 ? DesignerText::Wide(fields[10]) : L"";
+            selection.designMode = fields.size() >= 12 && fields[11] == "1";
+            selection.documentGeneration = g_state.documentGeneration;
+            g_nativeVisualDock.SetSelection(selection);
+            DesignerLog::Write("PREVIEW visual_selection type=" + fields[0] +
+                " id=" + fields[1]);
         }
         return S_OK;
     }
@@ -1580,7 +1954,9 @@ void ProcessQueuedUiEvent(PendingUiEvent* rawPending)
     IdeEventRouter::RouteResult result{
         false, "exception", "UI event processing failed"};
     try {
-        result = pending->commonCommand
+        if(!pending->commonCommand&&!g_controlEventsEnabled)
+            result={false,"readonly","预览模式不创建或跳转事件"};
+        else result = pending->commonCommand
         ? IdeEventRouter::GenerateCommonCode(g_state.mainWindow, pending->commonOptions)
             : IdeEventRouter::Route(g_state.mainWindow, g_state.mdiClient, pending->event);
     }
@@ -1635,7 +2011,17 @@ HRESULT OnNavigationCompleted(
         " status_hr=" + HResultText(statusResult) +
         " success=" + std::to_string(succeeded ? 1 : 0) +
         " web_error_status=" + std::to_string(static_cast<int>(status)));
-    if (succeeded != FALSE) {
+    if(succeeded!=FALSE&&g_state.designWorkspace) {
+        g_state.webView->ExecuteScript(
+            L"JSON.stringify({components:!!document.querySelector('#panel-body button'),canvas:!!document.querySelector('#canvas')})",
+            Callback<ICoreWebView2ExecuteScriptCompletedHandler>([generation](HRESULT hr,LPCWSTR result)->HRESULT {
+                if(generation==g_state.generation&&g_state.designWorkspace)
+                    DesignerLog::Write("DESIGN document_probe hr="+HResultText(hr)+" result="+
+                        (result?DesignerLog::ToUtf8(result):"null"));
+                return S_OK;
+            }).Get());
+    }
+    if (succeeded != FALSE && !g_state.designWorkspace) {
         InstallUiEventBridge();
         InstallRuntimeDiagnostics();
         RunFitToWindow();
@@ -1685,14 +2071,29 @@ HRESULT OnControllerCreated(
     g_state.webMessageTokenValid = SUCCEEDED(webMessageResult);
     DesignerLog::Write(
         "PREVIEW add_WebMessageReceived hr=" + HResultText(webMessageResult));
-    DesignerLog::Write("PREVIEW ui_event_bridge_build=15 designer_tools=1 health=1 diagnostics=1 compact_tools=1 visual_design=1 native_toolbox=1 pixel_nudge=1 element_description=1 floating_toolbox=1 explicit_design_panel=1");
+    DesignerLog::Write("PREVIEW ui_event_bridge_build=17 designer_tools=1 health=1 diagnostics=1 compact_tools=1 visual_design=1 native_toolbox=1 property_tab_replace=1 visual_properties=1 pixel_nudge=1 element_description=1 floating_toolbox=1 explicit_design_panel=1");
 
     auto startingHandler = Callback<ICoreWebView2NavigationStartingEventHandler>(
-        [generation](ICoreWebView2*,ICoreWebView2NavigationStartingEventArgs*) -> HRESULT {
+        [generation](ICoreWebView2*,ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
+            if(generation!=g_state.generation)return S_OK;
+            if(g_state.designWorkspace) {
+                LPWSTR uri=nullptr;args->get_Uri(&uri);
+                BOOL user=TRUE,redirect=TRUE;
+                args->get_IsUserInitiated(&user);args->get_IsRedirected(&redirect);
+                const bool allowed=uri&&DesignNavigation::Allow(uri,g_state.designNavigationUri,
+                    g_state.designNavigationPending,user!=FALSE,redirect!=FALSE);
+                if(allowed)g_state.designNavigationPending=false;
+                else args->put_Cancel(TRUE);
+                DesignerLog::Write(std::string("DESIGN navigation_start allowed=")+(allowed?"1":"0"));
+                if(uri)CoTaskMemFree(uri);
+            }
             if(generation==g_state.generation) {
                 ++g_state.documentGeneration;
                 g_commonPreview.ready=false;
                 g_visualDesignMode=false;
+                g_controlEventsEnabled=false;
+                g_nativeVisualDock.SetEventsEnabled(false);
+                g_nativeVisualDock.Clear();
                 PostMessageW(g_state.hostWindow,kNativeToolboxMessage,0,0);
             }
             return S_OK;
@@ -1788,23 +2189,43 @@ void EnsureWebView()
     }
 }
 
-bool CreateIdeCompatibilityScaffold(HWND hostWindow)
+void LayoutPreviewOverlay()
 {
-    // Some installed IDE visual extensions inspect every WM_MDICREATE child
-    // and expect the two-level shape used by the IDE home page. These hidden,
-    // zero-sized children make that inspection safe. WebView2 itself remains
-    // a direct child of the real MDI document window.
-    const HWND levelOne = CreateWindowExA(
-        0, "Static", "", WS_CHILD, 0, 0, 0, 0,
-        hostWindow, nullptr, g_state.module, nullptr);
-    if (levelOne == nullptr) {
-        return false;
+    if (g_state.hostWindow == nullptr || !IsWindow(g_state.hostWindow) ||
+        g_state.mdiClient == nullptr || !IsWindow(g_state.mdiClient)) return;
+    RECT client{};
+    GetClientRect(g_state.mdiClient,&client);
+    const int width=static_cast<int>(std::max<LONG>(0,client.right-client.left));
+    const int height=static_cast<int>(std::max<LONG>(0,client.bottom-client.top));
+    UINT flags=SWP_NOACTIVATE;
+    if(g_state.active) flags|=SWP_SHOWWINDOW;
+    else flags|=SWP_NOZORDER;
+    SetWindowPos(g_state.hostWindow,HWND_TOP,0,0,width,height,flags);
+    ResizeController();
+}
+
+LRESULT CALLBACK CodeTabSubclassProc(
+    HWND window,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR)
+{
+    if((message==WM_LBUTTONDOWN||message==WM_RBUTTONDOWN||message==WM_MBUTTONDOWN)&&
+        g_state.active) WebPreview::Hide();
+    if(message==WM_NCDESTROY) {
+        RemoveWindowSubclass(window,CodeTabSubclassProc,kCodeTabSubclassId);
+        g_state.codeTabSubclassed=false;
     }
-    const HWND levelTwo = CreateWindowExA(
-        0, "Static", "", WS_CHILD, 0, 0, 0, 0,
-        levelOne, reinterpret_cast<HMENU>(static_cast<INT_PTR>(1)),
-        g_state.module, nullptr);
-    return levelTwo != nullptr;
+    return DefSubclassProc(window,message,wParam,lParam);
+}
+
+LRESULT CALLBACK MdiClientSubclassProc(
+    HWND window,UINT message,WPARAM wParam,LPARAM lParam,UINT_PTR,DWORD_PTR)
+{
+    const LRESULT result=DefSubclassProc(window,message,wParam,lParam);
+    if(message==WM_MDIACTIVATE&&g_state.active) WebPreview::Hide();
+    if(message==WM_NCDESTROY) {
+        RemoveWindowSubclass(window,MdiClientSubclassProc,kMdiClientSubclassId);
+        g_state.mdiClientSubclassed=false;
+    }
+    return result;
 }
 
 void PaintHostBackground(HWND window)
@@ -1836,58 +2257,13 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         return 0;
     }
     switch (message) {
-    case WM_CREATE:
-        if (!CreateIdeCompatibilityScaffold(window)) {
-            DesignerLog::Write(
-                "PREVIEW MDI compatibility scaffold failed error=" +
-                std::to_string(GetLastError()));
-            return -1;
-        }
-        break;
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT:
         PaintHostBackground(window);
         return 0;
-    case WM_SIZE: {
-        const LRESULT result = DefMDIChildProcA(window, message, wParam, lParam);
+    case WM_SIZE:
         ResizeController();
-        return result;
-    }
-    case WM_MDIACTIVATE: {
-        const LRESULT result = DefMDIChildProcA(window, message, wParam, lParam);
-        const bool active = reinterpret_cast<HWND>(lParam) == window;
-        if (g_state.active != active) {
-            g_state.active = active;
-            DesignerLog::Write(active
-                ? "PREVIEW native_mdi_activated"
-                : "PREVIEW native_mdi_deactivated");
-        }
-        PostMessageW(window,kNativeToolboxMessage,0,0);
-        if (g_state.controller) {
-            g_state.controller->put_IsVisible(active ? TRUE : FALSE);
-        }
-        if (g_state.compatTabWindow != nullptr) {
-            InvalidateRect(g_state.compatTabWindow, nullptr, FALSE);
-        }
-        if (active) {
-            UpdateCodeTabCaption();
-            ResizeController();
-            EnsureWebView();
-        }
-        const HWND documentToMaximize = active
-            ? window
-            : reinterpret_cast<HWND>(lParam);
-        if (!g_state.maximizingDocument &&
-            documentToMaximize != nullptr && IsWindow(documentToMaximize)) {
-            PostMessageA(
-                window, kMaximizeDocumentMessage,
-                reinterpret_cast<WPARAM>(documentToMaximize), 0);
-        }
-        return result;
-    }
-    case kMaximizeDocumentMessage:
-        MaximizeMdiDocument(reinterpret_cast<HWND>(wParam));
         return 0;
     case kRouteUiEventMessage:
         ProcessQueuedUiEvent(reinterpret_cast<PendingUiEvent*>(lParam));
@@ -1896,9 +2272,18 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         g_nativeToolbox.SetEditable(g_visualDesignMode);
         g_nativeToolbox.Update(WebPreview::IsActive());
         return 0;
+    case kDesignPageMessage: {
+        std::wstring current;
+        if(static_cast<LPARAM>(g_state.documentGeneration)!=lParam||
+            !ReadRecentProjectPath(current)||current!=g_state.designProject)return 0;
+        g_state.designSourcePage=wParam!=0;
+        g_state.designWorkspace=!g_state.designSourcePage;
+        NavigateConfiguredPage();
+        WebPreview::Show();
+        return 0;
+    }
     case WM_TIMER:
         if (wParam == kRefreshTimerId) {
-            RetryCodeTabCaption();
             UpdateCompatTabLayout();
             WebPreview::Layout();
             PollFileChanges();
@@ -1912,8 +2297,7 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
         }
         return 0;
     case WM_CLOSE:
-        // Keep the fixed preview page registered and switch to another IDE
-        // document instead of leaving a stale native tab behind.
+        // The overlay is persistent; closing it returns to the native page.
         WebPreview::Hide();
         return 0;
     case WM_NCDESTROY:
@@ -1925,7 +2309,7 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
     default:
         break;
     }
-    return DefMDIChildProcA(window, message, wParam, lParam);
+    return DefWindowProcA(window, message, wParam, lParam);
 }
 
 bool RegisterWindowClasses()
@@ -1976,7 +2360,7 @@ void InitializeModule(HMODULE module)
     g_state.indexPath = BuildIndexPath();
 }
 
-bool Attach(HWND mainWindow, HWND mdiClient, HWND codeTab)
+bool Attach(HWND mainWindow, HWND mdiClient, HWND codeTab, bool runtimeEnabled)
 {
     if (g_state.hostWindow != nullptr && IsWindow(g_state.hostWindow) &&
         g_state.mainWindow == mainWindow && g_state.mdiClient == mdiClient &&
@@ -1997,71 +2381,76 @@ bool Attach(HWND mainWindow, HWND mdiClient, HWND codeTab)
     g_state.mainWindow = mainWindow;
     g_state.mdiClient = mdiClient;
     g_state.codeTab = codeTab;
+    g_state.runtimeEnabled = runtimeEnabled;
+    g_state.designWorkspace = !runtimeEnabled;
+    if(runtimeEnabled) {
     g_nativeToolbox.Initialize(mainWindow,g_state.module,[] { IdeEventRouter::ToggleNativeComponentBar(); },
         [](const std::wstring& kind) {
             if(g_state.webView && (kind==L"pointer" || kind==L"unavailable" || (g_visualDesignMode && WebPreview::IsActive())))
                 g_state.webView->PostWebMessageAsString((L"JADE_NATIVE_TOOLBOX\t"+kind).c_str());
         });
-    g_nativeDiagnostics.Initialize(mainWindow, g_state.module,
-        [](const std::wstring& assembly, const std::wstring& callback) {
-            ProjectAssembly::JumpToSubroutine(
-                g_state.mainWindow, g_state.mdiClient, assembly, callback);
+    g_nativeVisualDock.Initialize(mainWindow, g_state.module, ApplyNativeVisualEdit,
+        [](const NativeVisualDock::Selection& selection, const std::wstring& eventName,
+            const std::string& eventCode) {
+            return OperateNativeVisualEvent(selection, eventName, eventCode);
         });
-    g_nativeDiagnostics.Ensure();
-    g_state.tabCaptionEverUpdated = false;
-    g_state.tabCaptionUpdateAttempts = 0;
-    CaptureCodeTabInsertionPoint();
+    g_nativeVisualDock.Ensure();
+    g_nativeDiagnosticsDock.Initialize(mainWindow, g_state.module,
+        [](const std::wstring& assembly, const std::wstring& handler) {
+            if (ProjectAssembly::JumpToSubroutine(g_state.mainWindow, g_state.mdiClient,
+                    assembly.empty() ? L"Jade_通讯_订阅集" : assembly, handler)) WebPreview::Hide();
+        });
+    g_nativeDiagnosticsDock.Ensure();
+    DesignerLog::Write("PREVIEW native_diagnostics_tab ready=" +
+        std::to_string(g_nativeDiagnosticsDock.IsReady() ? 1 : 0));
+    DesignerLog::Write("PREVIEW native_property_tab ready=" +
+        std::to_string(g_nativeVisualDock.IsReady() ? 1 : 0));
+    }
+    if(!SetWindowSubclass(codeTab,CodeTabSubclassProc,kCodeTabSubclassId,0)) {
+        DesignerLog::Write("PREVIEW code_tab_subclass failed error="+std::to_string(GetLastError()));
+        Shutdown();return false;
+    }
+    g_state.codeTabSubclassed=true;
+    if(!SetWindowSubclass(mdiClient,MdiClientSubclassProc,kMdiClientSubclassId,0)) {
+        DesignerLog::Write("PREVIEW mdi_client_subclass failed error="+std::to_string(GetLastError()));
+        Shutdown();return false;
+    }
+    g_state.mdiClientSubclassed=true;
 
-    const HWND previousActive = reinterpret_cast<HWND>(
-        SendMessageA(mdiClient, WM_MDIGETACTIVE, 0, 0));
     const std::string caption = WideToAnsi(kTabText);
-    g_state.hostWindow = CreateMDIWindowA(
-        kHostClassName,
-        caption.c_str(),
-        WS_OVERLAPPEDWINDOW | WS_CHILD | WS_VISIBLE |
-            WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_MAXIMIZE,
-        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-        mdiClient,
-        g_state.module,
-        0);
+    g_state.hostWindow = CreateWindowExA(
+        WS_EX_NOPARENTNOTIFY,kHostClassName,caption.c_str(),
+        WS_CHILD|WS_CLIPSIBLINGS|WS_CLIPCHILDREN,
+        0,0,0,0,mdiClient,nullptr,g_state.module,nullptr);
     if (g_state.hostWindow == nullptr) {
         DesignerLog::Write(
-            "PREVIEW MDI CreateMDIWindow failed error=" +
+            "PREVIEW overlay CreateWindow failed error=" +
             std::to_string(GetLastError()));
+        Shutdown();
         return false;
     }
     EnsureCompatTabWindow();
-
-    // WM_MDICREATE has registered the real document. Update its custom tab
-    // item directly so the title has a non-zero width. WM_SETTEXT remains as
-    // a fallback for an unthemed/native implementation.
-    const bool tabUpdated = UpdateCodeTabCaption();
-    ++g_state.tabCaptionUpdateAttempts;
-    SetWindowTextA(g_state.hostWindow, caption.c_str());
-    if (!tabUpdated) {
-        DesignerLog::Write(
-            "PREVIEW native_code_tab_update not available; used WM_SETTEXT fallback");
-    }
     SetTimer(g_state.hostWindow, kRefreshTimerId, kRefreshIntervalMs, nullptr);
-    if (previousActive != nullptr && previousActive != g_state.hostWindow &&
-        IsWindow(previousActive)) {
-        SendMessageA(
-            mdiClient, WM_MDIACTIVATE,
-            reinterpret_cast<WPARAM>(previousActive), 0);
-        MaximizeMdiDocument(previousActive);
-        ShowWindow(g_state.hostWindow, SW_HIDE);
-        g_state.active = false;
-    }
-    else {
-        Show();
-    }
+    g_state.active=false;
+    LayoutPreviewOverlay();
+    EnsureWebView();
     DesignerLog::Write(
-        "PREVIEW native_mdi_tab_attached main=" + DesignerLog::HexPointer(mainWindow) +
+        "PREVIEW overlay_attached main=" + DesignerLog::HexPointer(mainWindow) +
         " mdi=" + DesignerLog::HexPointer(mdiClient) +
         " code_tab=" + DesignerLog::HexPointer(codeTab) +
         " host=" + DesignerLog::HexPointer(g_state.hostWindow) +
         " index_path=\"" + DesignerLog::ToUtf8(g_state.indexPath) + "\"");
     return true;
+}
+
+bool IsCurrentProjectWpe(HWND mainWindow, std::string* reason)
+{
+    std::string detectedReason;
+    const bool detected = DetectWpeIndex(mainWindow, detectedReason);
+    if (reason != nullptr) {
+        *reason = std::move(detectedReason);
+    }
+    return detected;
 }
 
 void Toggle()
@@ -2075,19 +2464,26 @@ void Show()
         DesignerLog::Write("PREVIEW show skipped: integration is not attached");
         return;
     }
-    ShowWindow(g_state.hostWindow, SW_SHOW);
-    UpdateCodeTabCaption();
-    UpdateCompatTabLayout();
-    SendMessageA(
-        g_state.mdiClient, WM_MDIACTIVATE,
-        reinterpret_cast<WPARAM>(g_state.hostWindow), 0);
-    MaximizeMdiDocument(g_state.hostWindow);
     g_state.active = true;
+    LayoutPreviewOverlay();
+    ShowWindow(g_state.hostWindow, SW_SHOW);
+    UpdateCompatTabLayout();
+    InvalidateRect(g_state.compatTabWindow,nullptr,FALSE);
     if (g_state.controller) {
         g_state.controller->put_IsVisible(TRUE);
     }
     EnsureWebView();
-    DesignerLog::Write("PREVIEW activated through native MDI tab");
+    SetFocus(g_state.hostWindow);
+    DesignerLog::Write("PREVIEW activated through safe overlay tab");
+}
+
+void ShowDesign()
+{
+    if(!g_state.designWorkspace&&!g_state.designSourcePage) {
+        g_state.designWorkspace=true;
+        NavigateConfiguredPage();
+    }
+    Show();
 }
 
 void Hide()
@@ -2097,32 +2493,12 @@ void Hide()
         !IsWindow(g_state.hostWindow)) {
         return;
     }
-    HWND nextWindow = GetWindow(g_state.mdiClient, GW_CHILD);
-    while (nextWindow != nullptr) {
-        if (nextWindow != g_state.hostWindow &&
-            (GetWindowLongPtrW(nextWindow, GWL_EXSTYLE) & WS_EX_MDICHILD) != 0) {
-            break;
-        }
-        nextWindow = GetWindow(nextWindow, GW_HWNDNEXT);
-    }
-    if (nextWindow != nullptr) {
-        SendMessageA(
-            g_state.mdiClient, WM_MDIACTIVATE,
-            reinterpret_cast<WPARAM>(nextWindow), 0);
-        ShowWindow(nextWindow, SW_SHOW);
-        g_state.active = false;
-        if (g_state.controller) {
-            g_state.controller->put_IsVisible(FALSE);
-        }
-    }
-    else {
-        ShowWindow(g_state.hostWindow, SW_HIDE);
-        g_state.active = false;
-        if (g_state.controller) {
-            g_state.controller->put_IsVisible(FALSE);
-        }
-    }
-    DesignerLog::Write("PREVIEW switched to another native MDI page");
+    ShowWindow(g_state.hostWindow,SW_HIDE);
+    g_state.active=false;
+    if(g_state.controller)g_state.controller->put_IsVisible(FALSE);
+    if(g_state.compatTabWindow)InvalidateRect(g_state.compatTabWindow,nullptr,FALSE);
+    if(g_state.designTabWindow)InvalidateRect(g_state.designTabWindow,nullptr,FALSE);
+    DesignerLog::Write("PREVIEW overlay hidden; native MDI page remains active");
 }
 
 void Refresh()
@@ -2137,23 +2513,22 @@ void Refresh()
 
 void Layout()
 {
-    g_nativeDiagnostics.Ensure();
-    g_nativeDiagnostics.Layout();
+    if(g_state.runtimeEnabled) {
+    g_nativeDiagnosticsDock.Ensure();
+    g_nativeDiagnosticsDock.Layout();
+    g_nativeVisualDock.Ensure();
+    g_nativeVisualDock.Layout();
+    }
     UpdateCompatTabLayout();
     if (g_state.hostWindow != nullptr && IsWindow(g_state.hostWindow)) {
-        ResizeController();
+        LayoutPreviewOverlay();
     }
 }
 
 bool IsActive()
 {
-    if (g_state.mdiClient != nullptr && IsWindow(g_state.mdiClient) &&
-        g_state.hostWindow != nullptr && IsWindow(g_state.hostWindow)) {
-        const HWND activeWindow = reinterpret_cast<HWND>(
-            SendMessageA(g_state.mdiClient, WM_MDIGETACTIVE, 0, 0));
-        g_state.active = activeWindow == g_state.hostWindow &&
-                         IsWindowVisible(g_state.hostWindow) != FALSE;
-    }
+    g_state.active=g_state.active&&g_state.hostWindow!=nullptr&&
+        IsWindow(g_state.hostWindow)&&IsWindowVisible(g_state.hostWindow)!=FALSE;
     return g_state.active;
 }
 
@@ -2165,16 +2540,29 @@ bool IsAttached()
 
 void Shutdown()
 {
+    g_nativeDiagnosticsDock.Shutdown();
     g_nativeToolbox.Shutdown();
-    g_nativeDiagnostics.Shutdown();
+    g_nativeVisualDock.Shutdown();
     g_visualDesignMode=false;
+    g_controlEventsEnabled=false;
+    g_nativeVisualDock.SetEventsEnabled(false);
     g_state.shuttingDown = true;
     ++g_state.generation;
     g_state.active = false;
+    if(g_state.codeTabSubclassed&&g_state.codeTab&&IsWindow(g_state.codeTab))
+        RemoveWindowSubclass(g_state.codeTab,CodeTabSubclassProc,kCodeTabSubclassId);
+    g_state.codeTabSubclassed=false;
+    if(g_state.mdiClientSubclassed&&g_state.mdiClient&&IsWindow(g_state.mdiClient))
+        RemoveWindowSubclass(g_state.mdiClient,MdiClientSubclassProc,kMdiClientSubclassId);
+    g_state.mdiClientSubclassed=false;
     if (g_state.compatTabWindow != nullptr && IsWindow(g_state.compatTabWindow)) {
         DestroyWindow(g_state.compatTabWindow);
     }
     g_state.compatTabWindow = nullptr;
+    if(g_state.designTabWindow && IsWindow(g_state.designTabWindow))DestroyWindow(g_state.designTabWindow);
+    g_state.designTabWindow=nullptr;
+    g_state.designProject.clear();g_state.designToken.clear();
+    g_state.designBytes.clear();g_state.designTaskBytes.clear();
     g_state.compatTabHover = false;
     if (g_state.compatTabFont != nullptr) {
         DeleteObject(g_state.compatTabFont);
@@ -2203,27 +2591,15 @@ void Shutdown()
     g_state.environment.Reset();
     const HWND hostWindow = g_state.hostWindow;
     if (hostWindow != nullptr && IsWindow(hostWindow)) {
-        if (g_state.mdiClient != nullptr && IsWindow(g_state.mdiClient)) {
-            SendMessageA(
-                g_state.mdiClient, WM_MDIDESTROY,
-                reinterpret_cast<WPARAM>(hostWindow), 0);
-        }
-        if (IsWindow(hostWindow)) {
-            DestroyWindow(hostWindow);
-        }
+        DestroyWindow(hostWindow);
     }
     g_state.hostWindow = nullptr;
     g_state.mainWindow = nullptr;
     g_state.mdiClient = nullptr;
     g_state.codeTab = nullptr;
-    g_state.tabMessageTarget = nullptr;
     g_state.webViewStarting = false;
     g_state.currentPageIsFile = false;
     g_state.lastWriteValid = false;
-    g_state.maximizingDocument = false;
-    g_state.tabCaptionEverUpdated = false;
-    g_state.codeTabIndex = -1;
-    g_state.tabCaptionUpdateAttempts = 0;
     if (g_state.comNeedsUninitialize) {
         CoUninitialize();
     }

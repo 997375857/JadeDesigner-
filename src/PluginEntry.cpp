@@ -1,9 +1,6 @@
 #include <Windows.h>
 
 #include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <sstream>
 #include <string>
 
 #include <fnshare.h>
@@ -12,6 +9,8 @@
 
 #include "DesignerLog.h"
 #include "IDEIntegration.h"
+
+extern "C" INT WINAPI JadeDesigner_MessageNotify(INT message, DWORD parameter1, DWORD parameter2);
 
 namespace {
 
@@ -27,93 +26,6 @@ HMODULE g_module = nullptr;
 HWND g_mainWindow = nullptr;
 std::atomic_bool g_notifySystemReady = false;
 bool g_modulesInitialized = false;
-PVOID g_faultProbe = nullptr;
-volatile LONG g_faultsReported = 0;
-
-// A fault inside e5.95 dies quietly: the IDE installs its own handler, so
-// Windows records neither an Application Error event nor a crash dump, and the
-// plugin log simply stops mid-operation with no indication of whose code was
-// running. A vectored handler runs ahead of every SEH frame, so it can name the
-// faulting address and the module that owns it while the process is still
-// alive. It only reports - returning EXCEPTION_CONTINUE_SEARCH leaves the
-// outcome exactly as it would have been without this handler.
-LONG CALLBACK ReportFault(EXCEPTION_POINTERS* pointers)
-{
-    if (pointers == nullptr || pointers->ExceptionRecord == nullptr) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
-    switch (record.ExceptionCode) {
-    case EXCEPTION_ACCESS_VIOLATION:
-    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
-    case EXCEPTION_DATATYPE_MISALIGNMENT:
-    case EXCEPTION_ILLEGAL_INSTRUCTION:
-    case EXCEPTION_IN_PAGE_ERROR:
-    case EXCEPTION_INT_DIVIDE_BY_ZERO:
-    case EXCEPTION_PRIV_INSTRUCTION:
-        break;
-    default:
-        // C++ throws and debugger notifications are ordinary traffic here, and
-        // a stack overflow leaves too little room to format a line safely.
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    // A fault that repeats must not turn the log into a flood.
-    if (InterlockedIncrement(&g_faultsReported) > 16) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-
-    const void* address = record.ExceptionAddress;
-    char moduleName[MAX_PATH] = "?";
-    std::uintptr_t offset = 0;
-    HMODULE owner = nullptr;
-    if (GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            static_cast<LPCSTR>(address), &owner) &&
-        owner != nullptr) {
-        if (GetModuleFileNameA(owner, moduleName, static_cast<DWORD>(sizeof(moduleName))) == 0) {
-            moduleName[0] = '?';
-            moduleName[1] = '\0';
-        }
-        offset = reinterpret_cast<std::uintptr_t>(address) - reinterpret_cast<std::uintptr_t>(owner);
-    }
-
-    const char* operation = "-";
-    std::uintptr_t touched = 0;
-    if (record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record.NumberParameters >= 2) {
-        switch (record.ExceptionInformation[0]) {
-        case 0: operation = "read"; break;
-        case 1: operation = "write"; break;
-        case 8: operation = "execute"; break;
-        default: break;
-        }
-        touched = static_cast<std::uintptr_t>(record.ExceptionInformation[1]);
-    }
-
-    char line[MAX_PATH + 256];
-    _snprintf_s(
-        line, sizeof(line), _TRUNCATE,
-        "CRASH exception=0x%08lX op=%s at=0x%08zX module=\"%s\"+0x%zX touched=0x%08zX thread=%lu",
-        static_cast<unsigned long>(record.ExceptionCode), operation,
-        reinterpret_cast<std::uintptr_t>(address), moduleName, offset, touched,
-        GetCurrentThreadId());
-    DesignerLog::WriteFromFault(line);
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
-void InstallFaultProbe()
-{
-    if (g_faultProbe == nullptr) {
-        g_faultProbe = AddVectoredExceptionHandler(1, ReportFault);
-    }
-}
-
-void RemoveFaultProbe()
-{
-    if (g_faultProbe != nullptr) {
-        RemoveVectoredExceptionHandler(g_faultProbe);
-        g_faultProbe = nullptr;
-    }
-}
 
 void EnsureModulesInitialized()
 {
@@ -121,21 +33,16 @@ void EnsureModulesInitialized()
         return;
     }
     DesignerLog::Initialize(g_module);
-    InstallFaultProbe();
     IDEIntegration::InitializeModule(g_module);
     g_modulesInitialized = true;
 }
 
 bool AttachToIde()
 {
-    EnsureModulesInitialized();
-    // NL_IDE_READY arrives again after the user re-selects the library, so the
-    // probe has to be re-armed here rather than only on first initialization.
-    InstallFaultProbe();
     if (!g_notifySystemReady) {
-        DesignerLog::Write("PLUGIN attach deferred: NotifySys is not ready");
         return false;
     }
+    EnsureModulesInitialized();
     g_mainWindow = reinterpret_cast<HWND>(NotifySys(NES_GET_MAIN_HWND, 0, 0));
     DesignerLog::Write(
         "PLUGIN main_window=" + DesignerLog::HexPointer(g_mainWindow) +
@@ -145,8 +52,8 @@ bool AttachToIde()
 
 INT WINAPI RunAddInFunction(INT index)
 {
+    if (!AttachToIde()) return NR_ERR;
     DesignerLog::Write("PLUGIN addin index=" + std::to_string(index));
-    AttachToIde();
     if (index == 0) {
         IDEIntegration::TogglePreview();
     }
@@ -185,7 +92,7 @@ LIB_INFOX BuildLibraryInfo()
     info.m_pCmdsFunc = nullptr;
     info.m_pfnRunAddInFn = RunAddInFunction;
     info.m_szzAddInFnInfo = kAddInInfo;
-    info.m_pfnNotify = nullptr;
+    info.m_pfnNotify = JadeDesigner_MessageNotify;
     info.m_pfnSuperTemplate = nullptr;
     info.m_szzSuperTemplateInfo = nullptr;
     info.m_nLibConstCount = 0;
@@ -202,13 +109,6 @@ LIB_INFOX BuildLibraryInfo()
 
 extern "C" INT WINAPI JadeDesigner_MessageNotify(INT message, DWORD parameter1, DWORD parameter2)
 {
-    EnsureModulesInitialized();
-    std::ostringstream stream;
-    stream << "PLUGIN notify message=" << message
-           << " parameter1=0x" << std::uppercase << std::hex << parameter1
-           << " parameter2=0x" << parameter2;
-    DesignerLog::Write(stream.str());
-
     if (message == NL_GET_CMD_FUNC_NAMES) {
         return 0;
     }
@@ -222,22 +122,20 @@ extern "C" INT WINAPI JadeDesigner_MessageNotify(INT message, DWORD parameter1, 
     const INT baseResult = ProcessNotifyLib(message, parameter1, parameter2);
     if (message == NL_SYS_NOTIFY_FUNCTION) {
         g_notifySystemReady = parameter1 != 0;
-        DesignerLog::Write(g_notifySystemReady ? "PLUGIN NotifySys ready" : "PLUGIN NotifySys missing");
         return baseResult;
     }
     if (message == NL_IDE_READY) {
-        AttachToIde();
-        return NR_OK;
+        return AttachToIde() ? NR_OK : NR_ERR;
     }
     if (message == NL_UNLOAD_FROM_IDE || message == NL_FREE_LIB_DATA) {
-        DesignerLog::Write("PLUGIN shutdown notification");
+        if (g_modulesInitialized) {
+            DesignerLog::Write("PLUGIN shutdown notification");
+            IDEIntegration::Stop();
+            g_modulesInitialized = false;
+        }
         g_notifySystemReady = false;
         g_mainWindow = nullptr;
-        // The handler lives in this module; leaving it registered past unload
-        // would turn the next exception anywhere in the IDE into a jump into
-        // freed code.
-        RemoveFaultProbe();
-        IDEIntegration::Stop();
+        ProcessNotifyLib(NL_SYS_NOTIFY_FUNCTION, 0, 0);
         return NR_OK;
     }
     return baseResult;
@@ -245,9 +143,8 @@ extern "C" INT WINAPI JadeDesigner_MessageNotify(INT message, DWORD parameter1, 
 
 extern "C" __declspec(dllexport) PLIB_INFOX WINAPI GetNewInf()
 {
-    EnsureModulesInitialized();
-    DesignerLog::Write("GetNewInf called; JadeHybrid 1.0 (IN_MEMORY_BRIDGE_QUEUED)");
-    g_libraryInfo.m_pfnNotify = JadeDesigner_MessageNotify;
+    // The configuration dialog also calls this during temporary library scans.
+    // It must be safe to FreeLibrary immediately, without lifecycle notices.
     return &g_libraryInfo;
 }
 

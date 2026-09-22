@@ -104,6 +104,13 @@ inline bool CssValue(const std::wstring& key,const std::wstring& value) {
     if(key==L"flex-direction")return value==L"row"||value==L"column";
     if(key==L"align-items")return value==L"stretch"||value==L"center"||value==L"flex-start"||value==L"flex-end";
     if(key==L"justify-content")return value==L"flex-start"||value==L"center"||value==L"flex-end"||value==L"space-between";
+    if(key==L"position")return value==L"static"||value==L"relative"||value==L"absolute"||value==L"fixed"||value==L"sticky";
+    if(key==L"left"||key==L"top") {
+        if(!value.ends_with(L"px")||value.size()<3||value.size()>9)return false;
+        const auto digits=value.substr(0,value.size()-2); const size_t start=digits[0]==L'-'?1:0;
+        if(start==digits.size()||digits.find_first_not_of(L"0123456789",start)!=digits.npos)return false;
+        const auto n=std::stol(digits); return n>=-4000&&n<=4000;
+    }
     if(!std::set<std::wstring>{L"width",L"height",L"font-size",L"border-radius",L"padding",L"gap"}.contains(key))return false;
     if((key==L"width"||key==L"height")&&(value==L"auto"||value==L"100%"))return true;
     if(!value.ends_with(L"px")||value.size()<3||value.size()>6)return false;
@@ -127,7 +134,7 @@ inline std::wstring Standard(const std::wstring& kind,const std::wstring& number
             L"=\"if(window.jade){jade.invoke('ui:"+id+L"',{value:this.value,checked:this.checked===true}).catch(function(){console.error('Jade request failed');});}else{console.warn('JadeView unavailable');}\"";
     };
     const auto base=L" style=\"box-sizing:border-box;max-width:100%;font:inherit;\"";
-    if(kind==L"button")return L"<button type=\"button\""+attr+event()+L" style=\"box-sizing:border-box;max-width:100%;font:inherit;padding:8px 16px;\">按钮"+number+L"</button>";
+    if(kind==L"button")return L"<button type=\"button\""+attr+event()+L" style=\"box-sizing:border-box;max-width:100%;font:inherit;font-weight:600;padding:8px 16px;min-height:38px;border:1px solid #27292d;border-radius:6px;background:#27292d;color:#fff;box-shadow:0 4px 10px #00000020;\">按钮"+number+L"</button>";
     if(kind==L"label")return L"<span"+attr+base+L">标签"+number+L"</span>";
     if(kind==L"heading")return L"<h2"+attr+L">标题"+number+L"</h2>";
     if(kind==L"input")return L"<input type=\"text\""+attr+base+L" placeholder=\"请输入内容\" aria-label=\"输入框"+number+L"\">";
@@ -137,7 +144,7 @@ inline std::wstring Standard(const std::wstring& kind,const std::wstring& number
         return L"<label><input type=\""+kind+L"\""+attr+event()+L" name=\""+(kind==L"radio"?L"jade_radio_group":id)+L"\">"+name+number+L"</label>";
     }
     if(kind==L"select")return L"<select"+attr+base+event()+L" aria-label=\"选择框"+number+L"\"><option value=\"1\">选项一</option><option value=\"2\">选项二</option><option value=\"3\">选项三</option></select>";
-    if(kind==L"container")return L"<div"+attr+L" style=\"display:flex;flex-direction:column;gap:12px;padding:12px;min-height:60px;box-sizing:border-box;border:1px solid #b9c8c1;\"></div>";
+    if(kind==L"container")return L"<div"+attr+L" style=\"display:flex;flex-direction:column;gap:12px;padding:12px;min-height:60px;box-sizing:border-box;border:1px solid #e5e5ea;border-radius:6px;\"></div>";
     if(kind==L"progress")return L"<progress"+attr+L" value=\"0\" max=\"100\" aria-label=\"进度条"+number+L"\"></progress>";
     return {};
 }

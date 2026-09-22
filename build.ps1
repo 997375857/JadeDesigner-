@@ -11,14 +11,16 @@ try {
     try {
         & node build.mjs
         if ($LASTEXITCODE) { throw 'Designer tools bundle failed; run npm ci in designer-tools first.' }
-        & node --test tests/static-text.test.mjs tests/diagnostics.test.mjs tests/visual-model.test.mjs
+        & node --test tests/static-text.test.mjs tests/diagnostics.test.mjs tests/visual-model.test.mjs tests/design-model.test.mjs
         if ($LASTEXITCODE) { throw 'Designer text mapping tests failed' }
     } finally { Pop-Location }
     & $msbuild 'jadehook\jadehook.vcxproj' -p:Configuration=Release -p:Platform=Win32 -v:minimal -nologo
     if ($LASTEXITCODE) { throw 'Hook build failed' }
     & (Join-Path $repo 'tests\run-tests.ps1')
+    & (Join-Path $repo 'tests\run-design-webview.ps1')
     & $msbuild 'JadeDesigner.sln' -p:Configuration=Release -p:Platform=x86 -v:minimal -nologo
     if ($LASTEXITCODE) { throw 'Plugin build failed' }
+    & (Join-Path $repo 'tests\run-plugin-lifecycle.ps1') -Library (Join-Path $repo 'bin\Release\JadeHybrid.fne')
     Copy-Item -LiteralPath (Join-Path $repo 'jadehook\bin\Release\jadehook.dll') -Destination (Join-Path $repo 'bin\Release\jadehook.dll')
     Get-FileHash -LiteralPath (Join-Path $repo 'bin\Release\JadeHybrid.fne'),(Join-Path $repo 'bin\Release\jadehook.dll') -Algorithm SHA256
 } finally { Pop-Location }

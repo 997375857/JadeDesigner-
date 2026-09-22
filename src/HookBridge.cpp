@@ -6,12 +6,14 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
 using GenerateAssemblyFn = BOOL(WINAPI*)(const char*, const char*, const char*);
 using InsertAnsiFn = BOOL(WINAPI*)(const char*);
 using ReadPageCodeFn = int(WINAPI*)(char*, int);
+using ListAssemblyNamesFn = int(WINAPI*)(char*, int);
 using LastReasonFn = const char*(WINAPI*)();
 constexpr UINT kIdeCodePage = 936;
 // The only host the hook accepts, and the first bytes of the editor's '.'
@@ -293,5 +295,56 @@ static int ReadNamed(const std::string& name, std::string& source, std::string& 
 }
 int ReadAssembly(const std::string& name,std::string& source,std::string& error) { return ReadNamed(name,source,error,false); }
 int ReadRoutine(const std::string& name,std::string& source,std::string& error) { return ReadNamed(name,source,error,true); }
+
+std::vector<std::wstring> ListAssemblyNames(std::string& error)
+{
+    error.clear();
+    std::vector<std::wstring> result;
+    if (!InspectHost().ok()) { error = "unsupported_host"; return result; }
+    HMODULE module = HookModule(error);
+    if (!module) return result;
+    const auto list = reinterpret_cast<ListAssemblyNamesFn>(ResolveExport(
+        module, "JadeHookListAssemblyNames", "_JadeHookListAssemblyNames@8"));
+    if (!list) { error = "assembly_names_export_missing"; return result; }
+    std::string buffer(kInitialPageBufferBytes, '\0');
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const int length = list(buffer.data(), static_cast<int>(buffer.size()));
+        if (length < 0 || length > 8 * 1024 * 1024) {
+            error = LastReason(module, "assembly_names_read_failed");
+            return {};
+        }
+        if (static_cast<size_t>(length) < buffer.size()) {
+            buffer.resize(static_cast<size_t>(length));
+            std::string name;
+            for (const char ch : buffer) {
+                if (ch == '\n' || ch == '\r') {
+                    if (!name.empty()) {
+                        const int n = MultiByteToWideChar(kIdeCodePage, MB_ERR_INVALID_CHARS,
+                            name.data(), static_cast<int>(name.size()), nullptr, 0);
+                        if (n <= 0) { error = "assembly_name_encoding_invalid"; return {}; }
+                        std::wstring wide(static_cast<size_t>(n), L'\0');
+                        MultiByteToWideChar(kIdeCodePage, MB_ERR_INVALID_CHARS,
+                            name.data(), static_cast<int>(name.size()), wide.data(), n);
+                        result.push_back(std::move(wide));
+                        name.clear();
+                    }
+                } else name += ch;
+            }
+            if (!name.empty()) {
+                const int n = MultiByteToWideChar(kIdeCodePage, MB_ERR_INVALID_CHARS,
+                    name.data(), static_cast<int>(name.size()), nullptr, 0);
+                if (n <= 0) { error = "assembly_name_encoding_invalid"; return {}; }
+                std::wstring wide(static_cast<size_t>(n), L'\0');
+                MultiByteToWideChar(kIdeCodePage, MB_ERR_INVALID_CHARS,
+                    name.data(), static_cast<int>(name.size()), wide.data(), n);
+                result.push_back(std::move(wide));
+            }
+            return result;
+        }
+        buffer.assign(static_cast<size_t>(length) + 1, '\0');
+    }
+    error = "assembly_names_changed_during_read";
+    return {};
+}
 
 } // namespace HookBridge

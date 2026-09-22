@@ -1,5 +1,7 @@
 # AI 提示词：写给 JadeView 易语言支持库的 HTML 控件命名规范
 
+> 本文是早期的命名参考。涉及控件动作、数据绑定、事件通道和实际运行时适配时，以最新版 [AI 生成 UI 与 JadeView 支持库对接规范](AI生成UI与JadeView支持库对接规范.md) 为准。HTML 属性本身不会自动发送通信，必须同时实现页面 JavaScript 适配层。
+
 把下面 `====` 之间的全部内容，粘贴给任何 AI（Claude / Cursor / GPT 都行），
 再跟上你的需求（"帮我写一个账号管理页面" 之类）。它生成的 HTML 就能让
 JadeDesigner 插件在易语言里直接生成中文子程序名。
@@ -89,11 +91,11 @@ JadeDesigner 插件在易语言里直接生成中文子程序名。
 | 属性 | 作用 | 默认 |
 |---|---|---|
 | `data-jade-handler` | 完整子程序名（**主要用这个**） | `<名字>_<事件后缀>` |
-| `data-jade-name` | 替换用来推名字的"名字"，注意它会连带把通道变成 `ui:<新名字>` | `id` |
+| `data-jade-name` | 可选的界面显示名称；不用于映射易语言变量，也不会替代稳定控件 ID | `id` |
 | `data-jade-channel` | 写死订阅通道 | 见上文优先级 |
 | `data-jade-assembly` | 指定生成到哪个程序集 | `Jade_通讯_订阅集` |
 
-一般只需要 `data-jade-handler` 一个。`data-jade-name` 会改变通道，除非你同时
+一般只需要 `data-jade-handler` 一个。列表对象绑定由易语言中的 `Jade超级列表框绑定` 赋值负责，`data-jade-name` 不用于把 HTML 控件映射到易语言变量，也不应为了事件生成而添加。`data-jade-name` 会改变通道，除非你同时
 写死了 `data-jade-channel`，否则**不要用**。
 
 ### 六、中文名字自己的规矩

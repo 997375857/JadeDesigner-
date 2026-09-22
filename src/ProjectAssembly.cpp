@@ -193,6 +193,70 @@ Lookup FindAndOpen(HWND mainWindow, HWND mdiClient, std::wstring_view name)
     return out;
 }
 
+std::vector<std::wstring> ListNames(HWND mainWindow)
+{
+    std::vector<std::wstring> out;
+    DWORD process = 0;
+    const DWORD thread = GetWindowThreadProcessId(mainWindow, &process);
+    if (!IsWindow(mainWindow) || process != GetCurrentProcessId() ||
+        thread != GetCurrentThreadId()) return out;
+    std::vector<HWND> trees;
+    EnumChildWindows(mainWindow, FindTrees, reinterpret_cast<LPARAM>(&trees));
+    if (trees.size() != 1) return out;
+    const HWND tree = trees.front();
+    const LRESULT count = SendMessageW(tree, TVM_GETCOUNT, 0, 0);
+    HTREEITEM root = Next(tree, TVGN_ROOT);
+    TVITEMW item{};
+    std::wstring label;
+    if (count <= 0 || count > kMaxItems || !root ||
+        !ReadItem(tree, root, item, label) || label != L"程序数据" ||
+        Next(tree, TVGN_NEXT, root) != nullptr) return out;
+    std::vector<HTREEITEM> pending{root};
+    std::set<HTREEITEM> visited;
+    while (!pending.empty()) {
+        const HTREEITEM current = pending.back();
+        pending.pop_back();
+        if (!visited.insert(current).second || visited.size() > static_cast<size_t>(count) ||
+            !ReadItem(tree, current, item, label)) return {};
+        if (current != root && item.iImage == kAssemblyImage && !label.empty()) {
+            out.push_back(label);
+        }
+        const HTREEITEM child = Next(tree, TVGN_CHILD, current);
+        if (!child && item.cChildren != 0) return {};
+        if (child) pending.push_back(child);
+        if (const HTREEITEM sibling = Next(tree, TVGN_NEXT, current)) pending.push_back(sibling);
+    }
+    if (visited.size() != static_cast<size_t>(count) ||
+        SendMessageW(tree, TVM_GETCOUNT, 0, 0) != count) return {};
+    return out;
+}
+
+std::vector<std::wstring> ListUserAssemblies(HWND mainWindow)
+{
+    std::vector<std::wstring> out;
+    DWORD process = 0;
+    const DWORD thread = GetWindowThreadProcessId(mainWindow, &process);
+    if (!IsWindow(mainWindow) || process != GetCurrentProcessId() ||
+        thread != GetCurrentThreadId()) return out;
+    std::vector<HWND> trees;
+    EnumChildWindows(mainWindow, FindTrees, reinterpret_cast<LPARAM>(&trees));
+    if (trees.size() != 1) return out;
+    const HWND tree = trees.front();
+    const LRESULT count = SendMessageW(tree, TVM_GETCOUNT, 0, 0);
+    HTREEITEM root = Next(tree, TVGN_ROOT);
+    TVITEMW item{};
+    std::wstring label;
+    if (count <= 0 || count > kMaxItems || !root ||
+        !ReadItem(tree, root, item, label) || label != L"程序数据" ||
+        Next(tree, TVGN_NEXT, root) != nullptr) return out;
+    for (HTREEITEM child = Next(tree, TVGN_CHILD, root); child;
+         child = Next(tree, TVGN_NEXT, child)) {
+        if (!ReadItem(tree, child, item, label)) return {};
+        if (item.iImage == kAssemblyImage && !label.empty()) out.push_back(label);
+    }
+    return out;
+}
+
 bool JumpToSubroutine(HWND mainWindow, HWND mdiClient,
     std::wstring_view assembly, std::wstring_view subroutine)
 {

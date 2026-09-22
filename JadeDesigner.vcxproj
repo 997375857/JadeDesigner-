@@ -85,9 +85,12 @@
     <ClInclude Include="elib\untshare.h" />
     <ClInclude Include="src\DesignerLog.h" />
     <ClInclude Include="src\DesignerInspection.h" />
+    <ClInclude Include="src\DesignerControlCatalog.h" />
+    <ClInclude Include="src\ListEventBinding.h" />
     <ClInclude Include="src\DesignerText.h" />
     <ClInclude Include="src\DesignerVisual.h" />
     <ClInclude Include="src\NativeToolbox.h" />
+    <ClInclude Include="src\NativeVisualDock.h" />
     <ClInclude Include="src\DesignerToolsScript.h" />
     <ClInclude Include="src\RuntimeDiagnosticsScript.h" />
     <ClInclude Include="src\DiagnosticsInstall.h" />
@@ -96,6 +99,7 @@
     <ClInclude Include="src\IDEIntegration.h" />
     <ClInclude Include="src\IdeEventRouter.h" />
     <ClInclude Include="src\ProjectAssembly.h" />
+    <ClInclude Include="src\ProjectWebDetection.h" />
     <ClInclude Include="src\PageSource.h" />
     <ClInclude Include="src\WebPreview.h" />
     <ClInclude Include="thirdparty\WebView2.h" />
