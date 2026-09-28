@@ -129,6 +129,64 @@ Jade设计与 Jade预览是不同阶段：前者保存用户布局和控件需�
 - 不要用整页 `innerHTML` 重建来更新一行数据，否则设计器选中的 DOM、事件和焦点都容易丢失。
 - 不要把整页做成 Canvas、图片或 Shadow DOM，除非明确接受无法按普通 HTML 控件编辑的代价。
 
+### 2.4 没有 ID 的原文字：`sourceLocator` 定位
+
+原网页里大量静态文字没有 `id`，但设计稿需要让它们可选中、可改文字。设计器**不会给原网页偷偷写入 ID**，而是在设计稿内部记录一条定位信息：
+
+```json
+{
+  "id": "jade-text-3f7a1c92",
+  "kind": "label",
+  "text": "百度弹窗助手",
+  "source": true,
+  "sourceLocator": {
+    "selector": "body > div:nth-of-type(1) > span:nth-of-type(2)",
+    "text": "百度弹窗助手"
+  }
+}
+```
+
+要求：
+
+- `source: true` 表示该节点来自原网页，改文字时只改原网页已有的文本节点，不新建 DOM。
+- `sourceLocator.selector` 必须是 `body > ` 开头、由 `tag:nth-of-type(n)` 逐级拼成的结构选择器，指向原网页中的一个确定元素。
+- `sourceLocator.text` 是导入当时的原文，用于落实修改前核对。选择器能命中但原文不符时，说明原文件结构已变化，**必须停止并说明，不能按内部 ID 猜测替换**。
+- `id`（如 `jade-text-3f7a1c92`）只是设计稿内部标识，由选择器与原文哈希得出，**不会出现在原网页里**。同名冲突时追加 `-1`、`-2`。
+
+**哪些文字会被识别为可编辑文字**（满足全部条件）：
+
+- 标签属于 `span`、`p`、`h1`~`h6`、`label`、`strong`、`em`、`small`、`legend`、`dt`、`dd`、`div`；
+- 文字是该元素的**直属文本节点**（`div` 还必须是该文本节点的直接父级，不允许跨越子结构）；
+- 不在 `button`、`a`、`select`、`textarea`、`svg`、`[data-jade-control]`、`[role="button"]` 内部；
+- 文字长度不超过 4000 字符。
+
+不满足时该元素按普通控件类型处理，不生成 `sourceLocator`。
+
+**导入时继承的原网页样式**（设计稿只记录这三个，避免整页样式污染）：
+
+| 设计稿字段 | 来源 | 规则 |
+| --- | --- | --- |
+| `style.fontSize` | `font-size` | 限制在 10 ~ 72 |
+| `style.bold` | `font-weight` | 数值 ≥ 600 记为 `true` |
+| `style.color` | `color` | `rgb(r, g, b)` 转 `#rrggbb` |
+
+**设计稿校验**：`sourceLocator` 一旦存在，必须同时满足 `source === true`、是对象、`selector` 是以 `body > ` 开头的非空字符串、`text` 是非空字符串，否则整份设计稿判定为无效。复制控件时 `source` 与 `sourceLocator` 一并剥离——副本是设计稿新增控件，不能继承原网页定位。
+
+**导出增量任务时的表达**：使用了 `sourceLocator` 的节点，定位以 `{ "selector": …, "originalText": … }` 形式输出，而不是内部 `id`：
+
+```json
+{ "kind": "label", "locate": { "selector": "body > div:nth-of-type(1) > span:nth-of-type(2)", "originalText": "百度弹窗助手" }, "fields": { "text": { "from": "百度弹窗助手", "to": "弹出助手" } } }
+```
+
+AI 落实这类修改时：
+
+1. 按 `selector` 在原网页中查找目标元素；
+2. 核对当前文本与 `originalText` 一致；
+3. 不一致就停止并说明，不要改到相邻的图标、按钮或子结构；
+4. 只替换该文本节点，不重建父元素。
+
+另：导出增量任务前，设计器会重新读取工程 `web/index.html` 与设计稿导入时的基线比对；网页在设计期间被外部改动过，导出会被拒绝并提示重新核对，避免按旧结构定位改错内容。
+
 ---
 
 ## 三、页面 JavaScript 必须有运行时适配层
