@@ -31,6 +31,7 @@
 .jade-ui-control .grid-head>span:last-child{border-right:0}
 .jade-ui-control .grid-empty{display:grid;place-items:center;flex:1;color:var(--jade-muted);font-size:12px;background-image:linear-gradient(transparent calc(100% - 1px),color-mix(in srgb,var(--jade-line) 45%,transparent) 1px)}
 .jade-ui-control:is(.kind-checkbox,.kind-radio,.kind-progress,.kind-slider,.kind-label){background:transparent;border-color:transparent;box-shadow:none}
+.jade-ui-control.kind-label:not(.preset-badge){padding:0;border:0;line-height:1.2}
 .jade-ui-control .check-mark,.jade-ui-control .radio-mark{display:inline-block;width:16px;height:16px;border:1px solid color-mix(in srgb,var(--jade-ink) 40%,var(--jade-paper));background:var(--jade-paper);flex:none;border-radius:3px}
 .jade-ui-control .radio-mark{border-radius:50%}
 .jade-ui-control input{accent-color:var(--jade-accent)}

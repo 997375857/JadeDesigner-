@@ -5,12 +5,12 @@ import {build} from 'esbuild';
 import {chromium} from 'playwright';
 import {newDesign,newComponent,buildRequest,themeOf,upgradeDefaultTheme} from '../design-model.js';
 
-test('portable component skin is exported without replacing explicit draft colors',async()=>{
+test('task includes changed theme colors without embedding the complete component skin',async()=>{
   const doc=newDesign(),skin=await readFile('jade-ui-theme.css','utf8');
   assert.equal(themeOf(doc).primary,'#27292d');
   doc.theme.primary='#aa3355';
-  const task=buildRequest(doc,'FULL SPEC',skin);
-  assert.match(task,/#aa3355/);assert.ok(task.includes(skin));assert.ok(task.includes('FULL SPEC'));
+  const task=buildRequest(doc);
+  assert.match(task,/#aa3355/);assert.ok(!task.includes(skin));assert.ok(task.length<1000);
   assert.doesNotMatch(skin,/#canvas|#inspector|pointer-events\s*:\s*none/);
 });
 
@@ -57,7 +57,8 @@ test('neutral component gallery renders and exports the same reusable skin',asyn
     assert.equal(await page.locator('#canvas .preset-dialog .layout-field').count(),2);
     assert.equal(await page.locator('#canvas .preset-sidebar .nav-icon svg').count(),4);
     await page.getByRole('button',{name:'生成 AI 开发任务',exact:true}).click();
-    assert.ok((await page.getByLabel('AI 开发任务',{exact:true}).inputValue()).includes(await readFile('jade-ui-theme.css','utf8')));
+    const task=await page.getByLabel('AI 开发任务',{exact:true}).inputValue();
+    assert.match(task,/新增：/);assert.ok(!task.includes(await readFile('jade-ui-theme.css','utf8')));
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await mkdir('../artifacts/design-workspace',{recursive:true});
     await page.screenshot({path:'../artifacts/design-workspace/component-theme.png',fullPage:true});

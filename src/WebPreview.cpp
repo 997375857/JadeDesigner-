@@ -749,13 +749,7 @@ bool DetectWpeIndex(HWND mainWindow, std::string& reason)
         reason = "web_index_unreadable";
         return false;
     }
-    const auto marker = ProjectWebDetection::Marker(content);
-    if (!marker.empty()) {
-        reason = "marker=" + std::string(marker);
-        return true;
-    }
-    reason = "jade_marker_missing";
-    return false;
+    return ProjectWebDetection::Detect(content, DirectoryOf(indexPath), reason);
 }
 
 bool ReadRecentProjectPath(std::wstring& projectPath)
@@ -2053,6 +2047,9 @@ HRESULT OnControllerCreated(
 
     ResizeController();
     g_state.controller->put_IsVisible(g_state.active ? TRUE : FALSE);
+    if (g_state.active && GetFocus() == g_state.hostWindow) {
+        g_state.controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+    }
 
     ComPtr<ICoreWebView2Settings> settings;
     if (SUCCEEDED(g_state.webView->get_Settings(&settings)) && settings) {
@@ -2433,12 +2430,13 @@ bool Attach(HWND mainWindow, HWND mdiClient, HWND codeTab, bool runtimeEnabled)
     SetTimer(g_state.hostWindow, kRefreshTimerId, kRefreshIntervalMs, nullptr);
     g_state.active=false;
     LayoutPreviewOverlay();
-    EnsureWebView();
+    // Keep IDE startup light; Show() creates WebView2 on first use.
     DesignerLog::Write(
         "PREVIEW overlay_attached main=" + DesignerLog::HexPointer(mainWindow) +
         " mdi=" + DesignerLog::HexPointer(mdiClient) +
         " code_tab=" + DesignerLog::HexPointer(codeTab) +
         " host=" + DesignerLog::HexPointer(g_state.hostWindow) +
+        " webview_start=deferred" +
         " index_path=\"" + DesignerLog::ToUtf8(g_state.indexPath) + "\"");
     return true;
 }

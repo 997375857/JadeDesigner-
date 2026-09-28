@@ -1,5 +1,4 @@
 import {createIcons, MousePointer2, Hand, Square, Type, TextCursorInput, ChevronDown, Table2, ListTree, CheckSquare, CircleDot, PanelsTopLeft, Gauge, SlidersHorizontal, Hash, Undo2, Redo2, Save, Download, Upload, Copy, Trash2, FilePlus2, Layers, Palette, Shapes, Sparkles, Plus, Minus, Maximize, Eye, EyeOff, Lock, LockOpen, ArrowUp, ArrowDown, Group, Ungroup, AlignLeft, AlignCenter, AlignRight, Search, Check, Settings, Play, User, Star, PanelLeftClose, LayoutTemplate} from 'lucide';
-import spec from '../docs/AI生成UI与JadeView支持库对接规范.md';
 import css from './design-workspace.css';
 import {House,Heart,Menu,Bell,Folder,ChartColumn,X} from 'lucide';
 import componentCss from './design-components.css';
@@ -20,7 +19,7 @@ document.body.innerHTML=`<header><div class="brand"><i data-lucide="layers"></i>
 <section id="viewport" aria-label="设计画布"><div id="stage"><div id="artboard-label"><i data-lucide="panels-top-left"></i><span id="artboard-name"></span><span id="artboard-size"></span></div><div id="canvas"></div></div><div id="canvas-tools"></div><div id="zoom-tools"></div></section>
 <aside id="inspector"><div class="panel-heading"><h2 id="inspector-title">画布</h2><span id="selection-count"></span></div><div id="property-tabs"></div><div id="fields"></div></aside></main>
 <footer><span id="project"></span><span>设计稿 · 待 AI 实现</span></footer>
-<dialog id="export"><form method="dialog"><h2>AI 开发任务</h2><button value="close">关闭</button></form><textarea aria-label="AI 开发任务" readonly></textarea><button id="copy">复制完整任务</button><button id="download">下载任务文件</button></dialog><input id="file" type="file" accept=".json,application/json" hidden>`;
+<dialog id="export"><form method="dialog"><h2>AI 开发任务</h2><button value="close">关闭</button></form><textarea aria-label="AI 开发任务" readonly></textarea><button id="copy">复制任务</button><button id="download">下载任务文件</button></dialog><input id="file" type="file" accept=".json,application/json" hidden>`;
 const $=s=>document.querySelector(s),status=text=>$('#status').textContent=text;
 let doc=newDesign(),selected='',chosen=new Set(),undo=[],redo=[],sourceHtml='',reservedIds=[],ready=false,saving=false,serial=0,projectKey='',lastSaved='',pending=new Map();
 let panel='components',propertyTab='design',search='',mode='select',space=false,snap=true;
@@ -80,6 +79,7 @@ function nodeView(n,mini=false){
   if(n.preset)view.classList.add('preset-'+n.preset);
   Object.assign(view.style,{borderRadius:(s.radius??t.radius)+'px',fontFamily:t.font,fontSize:(s.fontSize??t.fontSize)+'px',textAlign:s.align,transitionDuration:t.motion+'ms'});
   if(s.background)view.style.background=s.background;if(s.color)view.style.color=s.color;
+  if(s.bold)view.style.fontWeight='700';
   const span=(text,cls='')=>{const e=document.createElement('span');e.textContent=text;e.className=cls;view.append(e);return e;};
   if(isNavigation(n)){
     const nav=navigationOf(n),rail=n.preset==='navigation-rail';
@@ -250,6 +250,15 @@ function renderProperties(){
     field(fields,'行为与样式要求',n.note,v=>set('note',v),'textarea');
     const p=document.createElement('p');p.className='contract-status';p.textContent=n.kind==='super-list'?'易语言绑定：Jade超级列表框绑定\n表项操作与列表事件按完整规范实现。':n.kind==='button'?'业务按钮需真实 jade.invoke 调用。':'事件接入范围以模块对接规范为准。';fields.append(p);return;
   }
+  if(!n.source&&!doc.baseline.some(item=>item.id===n.id)&&((n.kind==='container'&&!n.preset)||(n.kind==='edit'&&n.preset==='textarea'))){
+    heading(fields,'控件用途');
+    choices(fields,'控件用途',[['container','区域'],['textarea','多行编辑框']],n.preset==='textarea'?'textarea':'container',value=>edit(d=>{
+      const node=d.nodes.find(item=>item.id===n.id);
+      node.kind=value==='textarea'?'edit':'container';
+      if(value==='textarea')node.preset='textarea';
+      else{delete node.preset;node.placeholder='';}
+    }));
+  }
   heading(fields,'内容');const textInput=field(fields,'显示文字',n.text,v=>set('text',v));if(n.source&&!sourceCanvas.canEditText(n.id)){textInput.readOnly=true;textInput.title='复杂或动态内容，交给 AI 修改原网页';}if(n.kind==='edit')field(fields,'提示文本',n.placeholder,v=>set('placeholder',v));
   if(isNavigation(n)){
     const nav=navigationOf(n);
@@ -270,6 +279,7 @@ function renderProperties(){
   }
   heading(fields,'布局');const geometry=document.createElement('div');geometry.className='geometry';fields.append(geometry);for(const [key,name] of [['x','左边'],['y','顶边'],['width','宽度'],['height','高度']])field(geometry,name,n[key],v=>set(key,v),'number',key==='x'||key==='y'?0:24,4000);
   choices(fields,'文字对齐',[['left','左对齐','align-left'],['center','居中','align-center'],['right','右对齐','align-right']],s.align,v=>setStyle('align',v));
+  toggle(fields,'粗体',s.bold,v=>setStyle('bold',v));
   heading(fields,'样式');if(n.kind==='button'){
     choices(fields,'按钮样式',[['filled','填充'],['tonal','柔色'],['outline','描边'],['text','文字']],s.variant,v=>setStyle('variant',v));
     const select=document.createElement('select');select.setAttribute('aria-label','按钮图标');for(const [value,text] of [['','无图标'],['plus','添加'],['search','搜索'],['check','确认'],['download','下载'],['settings','设置'],['play','开始'],['user','用户'],['star','收藏']]){const option=new Option(text,value);select.add(option);}select.value=s.icon;select.onchange=()=>run(()=>setStyle('icon',select.value));fields.append(select);
@@ -301,6 +311,7 @@ button($('#tools'),'保存设计稿','save',save);button($('#tools'),'导入设�
 button($('#tools'),'新建设计稿','file-plus-2',()=>{if(confirm('清空当前设计稿？已有网页不会修改。')){remember();doc=newDesign();chosen.clear();selected='';changed();fit();}});
 button($('#tools'),'生成 AI 开发任务','sparkles',exportTask,'AI 开发任务').className='primary-command';
 const ct=$('#canvas-tools');choices(ct,'画布模式',[['select','选择','mouse-pointer-2'],['hand','抓手','hand']],mode,v=>{mode=v;for(const b of ct.querySelectorAll('[aria-pressed]'))b.setAttribute('aria-pressed',String(b.title===(mode==='select'?'选择':'抓手')));applyCamera();});
+button(ct,'添加文字','type',()=>{add('label');const input=$('#fields input[aria-label="显示文字"]');input?.focus();input?.select();});
 button(ct,'撤销','undo-2',undoAction).id='undo';button(ct,'重做','redo-2',redoAction).id='redo';button(ct,'复制控件','copy',duplicate);button(ct,'删除控件','trash-2',remove).id='delete';toggle(ct,'吸附',snap,v=>snap=v);
 button($('#zoom-tools'),'缩小','minus',()=>zoomTo(camera.zoom/1.2));button($('#zoom-tools'),'实际尺寸',null,()=>zoomTo(1),'100%').id='zoom-value';button($('#zoom-tools'),'放大','plus',()=>zoomTo(camera.zoom*1.2));button($('#zoom-tools'),'适应窗口','maximize',fit);
 $('#viewport').addEventListener('wheel',e=>{e.preventDefault();const r=$('#viewport').getBoundingClientRect();if(e.ctrlKey||e.metaKey)zoomTo(camera.zoom*Math.exp(-e.deltaY*.002),{x:e.clientX-r.left,y:e.clientY-r.top});else {camera.x-=e.deltaX;camera.y-=e.deltaY;applyCamera();}},{passive:false});
@@ -334,7 +345,14 @@ async function editSource(record=true){
   }catch(error){sourceCanvas.clear();status(error.message);throw error;}
   finally{sourceLoading=false;}
 }
-async function exportTask(){const snapshot=await save(),request=buildRequest(snapshot,spec,themeCss);$('#export textarea').value=request;$('#export').showModal();if(bridge){await native('design_export',request);status('任务与完整规范已写入工程');}}
+async function exportTask(){
+  if(bridge&&sourceHtml){
+    const [currentHtml]=await native('design_edit_source');
+    if(currentHtml!==sourceHtml)throw Error('本地 web/index.html 已变化，设计稿基线可能过期；请核对最新网页与设计稿后再导出');
+  }
+  const snapshot=await save(),request=buildRequest(snapshot,sourceHtml);$('#export textarea').value=request;$('#export').showModal();
+  if(bridge){await native('design_export',request);status('增量任务已写入工程');}
+}
 function download(name,text){const url=URL.createObjectURL(new Blob([text],{type:'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 $('#copy').onclick=async()=>{try{await navigator.clipboard.writeText($('#export textarea').value);status('完整 AI 任务已复制');}catch{status('复制失败，可下载任务文件');}};$('#download').onclick=()=>download('Jade-AI开发任务.md',$('#export textarea').value);
 $('#file').onchange=async e=>{try{const f=e.target.files[0];if(!f)return;if(f.size>1024*1024)throw Error('设计稿超过 1 MB');const next=validate(JSON.parse(await f.text()));remember();doc=next;selected='';chosen.clear();changed();fit();}catch(error){status(error.message);}finally{e.target.value='';}};

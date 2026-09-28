@@ -1,6 +1,23 @@
 import {newNode,clone,styleOf} from './design-model.js';
 
 const candidates='[data-jade-control],button,input,select,textarea,progress,[role="grid"],[role="tree"],a[id],label[id],h1[id],h2[id],h3[id],div[id],section[id],nav[id]';
+const textCandidates='span,p,h1,h2,h3,h4,h5,h6,label,strong,em,small,legend,dt,dd,div';
+function textLocator(e,text){
+  const parts=[];
+  for(let current=e;current&&current.tagName!=='BODY';current=current.parentElement){
+    const tag=current.localName;
+    const siblings=[...current.parentElement.children].filter(s=>s.localName===tag);
+    parts.unshift(`${tag}:nth-of-type(${siblings.indexOf(current)+1})`);
+  }
+  return {selector:'body > '+parts.join(' > '),text};
+}
+function textIdentity(locator,ids){
+  let hash=2166136261;
+  for(const c of locator.selector+'\n'+locator.text)hash=Math.imul(hash^c.charCodeAt(0),16777619)>>>0;
+  const base='jade-text-'+hash.toString(16);let id=base,i=1;
+  while(ids.has(id))id=base+'-'+i++;
+  return id;
+}
 function kindOf(e){
   const declared=e.getAttribute('data-jade-control');
   if(declared)return declared==='list'?'super-list':declared;
@@ -35,32 +52,45 @@ export function sourceDocument(html,baseUrl){
 export function createSourceCanvas(){
   const frame=document.createElement('iframe');frame.className='source-canvas-page';frame.title='原网页画布';
   frame.setAttribute('sandbox','allow-same-origin');frame.tabIndex=-1;
-  let originals=new Map(),ready=false;
+  let originals=new Map(),identities=new WeakMap(),ready=false;
   const labelNode=e=>{
-    if(e.matches('input,select,textarea,progress,div,section,nav'))return null;
+    if(e.matches('input,select,textarea,progress,section,nav'))return null;
     const walker=e.ownerDocument.createTreeWalker(e,4),texts=[];
     while(walker.nextNode()){const n=walker.currentNode;if(n.nodeValue.trim()&&!n.parentElement.closest('style,script,svg,i,[aria-hidden=true]'))texts.push(n);}
-    return texts.length===1?texts[0]:null;
+    return texts.length===1&&(!e.matches('div')||texts[0].parentElement===e)?texts[0]:null;
   };
   const nodes=()=>{
     const result=[],ids=new Set(),d=frame.contentDocument;
     for(const e of d.querySelectorAll('[id]')){if(ids.has(e.id))throw Error('原网页控件 ID 重复：'+e.id);ids.add(e.id);}
-    for(const e of d.querySelectorAll(candidates)){
-      const id=e.getAttribute('data-jade-id')||e.id;if(!id||id!==e.id)continue;
+    const elements=new Set(d.querySelectorAll(candidates));
+    for(const e of d.querySelectorAll(textCandidates)){
+      const text=labelNode(e);
+      if(text?.parentElement===e&&text.nodeValue.trim().length<=4000&&!e.closest('button,a,select,textarea,svg,[data-jade-control],[role=button]'))elements.add(e);
+    }
+    for(const e of elements){
+      const text=labelNode(e),plainText=text?.parentElement===e&&e.matches(textCandidates)&&!e.closest('button,a,select,textarea,svg,[data-jade-control],[role=button]');
+      let id=e.getAttribute('data-jade-id')||e.id,locator;
+      if(id&&id!==e.id)continue;
+      if(!id){if(!plainText)continue;locator=textLocator(e,text.nodeValue.trim());id=textIdentity(locator,ids);ids.add(id);}
       const r=e.getBoundingClientRect(),cs=d.defaultView.getComputedStyle(e);
       if(r.width<1||r.height<1||r.x<0||r.y<0||r.x>4000||r.y>4000||cs.visibility==='hidden')continue;
-      let n;try{n=newNode(kindOf(e),result);}catch{continue;}
+      let n;try{n=newNode(plainText?'label':kindOf(e),result);}catch{continue;}
       n.id=id;n.source=true;n.x=Math.round(r.x);n.y=Math.round(r.y);
       n.width=Math.max(24,Math.min(4000,Math.round(r.width)));n.height=Math.max(24,Math.min(4000,Math.round(r.height)));
-      const text=labelNode(e);
-      n.text=(e.matches('input,textarea')?(e.getAttribute('value')||''):e.matches('select')?(e.selectedOptions[0]?.textContent||''):(text?.nodeValue.trim()||e.getAttribute('aria-label')||e.id)).slice(0,120);
+      if(locator)n.sourceLocator=locator;
+      if(n.kind==='label'){
+        const rgb=cs.color.match(/^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/);
+        n.style={fontSize:Math.max(10,Math.min(72,parseFloat(cs.fontSize)||14)),bold:Number(cs.fontWeight)>=600};
+        if(rgb)n.style.color='#'+rgb.slice(1).map(v=>Number(v).toString(16).padStart(2,'0')).join('');
+      }
+      n.text=(e.matches('input,textarea')?(e.getAttribute('value')||''):e.matches('select')?(e.selectedOptions[0]?.textContent||''):(text?.nodeValue.trim()||e.getAttribute('aria-label')||e.id)).slice(0,n.kind==='label'?4000:120);
       n.placeholder=e.getAttribute('placeholder')||'';n.handler=e.getAttribute('data-jade-handler')||'';n.channel=e.getAttribute('data-jade-channel')||'';
       n.note='原网页控件；保持原 DOM、样式和业务逻辑。画布修改为设计意图，交给 AI 增量落实到原网页。';
       if(n.kind==='super-list'){
         const columns=[...e.querySelectorAll('th,[role=columnheader]')].map(h=>({title:h.textContent.trim(),width:Math.max(24,Math.min(2000,Math.round(h.getBoundingClientRect().width)))})).filter(c=>c.title);
         if(columns.length)n.columns=columns.slice(0,64);
       }
-      originals.set(id,{element:e,node:clone(n),style:e.getAttribute('style'),text,textValue:text?.nodeValue});result.push(n);
+      originals.set(id,{element:e,node:clone(n),style:e.getAttribute('style'),text,textValue:text?.nodeValue});identities.set(e,id);result.push(n);
       if(result.length===500)break;
     }
     return result;
@@ -71,7 +101,7 @@ export function createSourceCanvas(){
     get title(){return frame.contentDocument?.title?.trim().slice(0,120)||'';},
     canEditText(id){const o=originals.get(id);return !!(o?.text||o?.element.matches('input,textarea'));},
     async load(html,baseUrl,host){
-      ready=false;originals=new Map();
+      ready=false;originals=new Map();identities=new WeakMap();
       const loaded=new Promise((resolve,reject)=>{
         const timer=setTimeout(()=>reject(Error('原网页样式载入超时')),15000);
         frame.onload=()=>{clearTimeout(timer);resolve();};
@@ -83,7 +113,7 @@ export function createSourceCanvas(){
     bounds(id){const e=originals.get(id)?.element;return e?.getBoundingClientRect();},
     hit(x,y){
       let e=frame.contentDocument?.elementFromPoint(x,y);
-      while(e){if(originals.has(e.id))return e.id;e=e.parentElement;}return '';
+      while(e){if(identities.has(e))return identities.get(e);e=e.parentElement;}return '';
     },
     scroll(x,y,dx,dy){
       const d=frame.contentDocument;let e=d?.elementFromPoint(x,y);
@@ -104,10 +134,11 @@ export function createSourceCanvas(){
         if(n.height!==b.height)e.style.setProperty('height',n.height+'px','important');
         if(n.x!==b.x||n.y!==b.y)e.style.setProperty('translate',`${n.x-b.x}px ${n.y-b.y}px`,'important');
         if(n.text!==b.text&&o.text)o.text.nodeValue=n.text;
+        if(s.bold!==styleOf(b).bold)e.style.setProperty('font-weight',s.bold?'700':'400','important');
         if(e.matches('input,textarea')){e.value=n.text;e.setAttribute('placeholder',n.placeholder);}
         for(const [key,value]of [['background',s.background],['color',s.color],['font-size',s.fontSize===null?null:s.fontSize+'px'],['border-radius',s.radius===null?null:s.radius+'px']])if(value!==null)e.style.setProperty(key,value,'important');
       }
     },
-    clear(){frame.remove();frame.srcdoc='';originals.clear();ready=false;}
+    clear(){frame.remove();frame.srcdoc='';originals.clear();identities=new WeakMap();ready=false;}
   };
 }

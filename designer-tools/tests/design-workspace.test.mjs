@@ -5,6 +5,28 @@ import {build} from 'esbuild';
 import {chromium} from 'playwright';
 import {resizeGeometry,RESIZE_DIRECTIONS} from '../design-components.js';
 
+test('a new region can be identified as a multiline edit in the AI task',async()=>{
+  const bundle=await build({entryPoints:['design-workspace.js'],bundle:true,format:'iife',write:false,loader:{'.md':'text','.css':'text'}});
+  const browser=await chromium.launch({channel:'msedge',headless:true});
+  try{
+    const page=await browser.newPage(),errors=[];
+    page.on('pageerror',e=>errors.push(e.message));
+    await page.route('https://jade-design.test/**',r=>r.fulfill({contentType:'text/html',body:'<!doctype html><html><head></head><body></body></html>'}));
+    await page.goto('https://jade-design.test/');await page.addScriptTag({content:bundle.outputFiles[0].text});
+    await page.waitForFunction(()=>document.querySelector('#status').textContent.includes('就绪'));
+    await page.getByRole('button',{name:'区域',exact:true}).click();
+    await page.getByLabel('显示文字',{exact:true}).fill('logOutput');
+    await page.getByLabel('显示文字',{exact:true}).press('Tab');
+    await page.getByRole('group',{name:'控件用途'}).getByRole('button',{name:'多行编辑框'}).click();
+    assert.equal(await page.locator('#canvas .kind-edit.preset-textarea').count(),1);
+    await page.getByRole('button',{name:'生成 AI 开发任务',exact:true}).click();
+    const task=await page.getByLabel('AI 开发任务',{exact:true}).inputValue();
+    assert.match(task,/"kind":"edit"/);assert.match(task,/"preset":"textarea"/);
+    assert.doesNotMatch(task,/待核对/);
+    assert.deepEqual(errors,[]);
+  }finally{await browser.close();}
+});
+
 test('navigation rails render icons and export editable menu configuration',async()=>{
   const bundle=await build({entryPoints:['design-workspace.js'],bundle:true,format:'iife',write:false,loader:{'.md':'text','.css':'text'}});
   const browser=await chromium.launch({channel:'msedge',headless:true});
@@ -31,7 +53,7 @@ test('navigation rails render icons and export editable menu configuration',asyn
     assert.equal(await rail.locator('.nav-item.active').getAttribute('data-item-id'),'item-1');
     await page.getByRole('button',{name:'生成 AI 开发任务',exact:true}).click();
     const task=await page.getByLabel('AI 开发任务',{exact:true}).inputValue();
-    assert.match(task,/"icon": "chart"/);assert.match(task,/工作台/);
+    assert.match(task,/"icon":"chart"/);assert.match(task,/工作台/);
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await page.screenshot({path:'../artifacts/design-workspace/navigation-rail.png',fullPage:true});
     await page.getByRole('button',{name:'侧边导航',exact:true}).click();
@@ -116,7 +138,7 @@ test('design workspace edits, drags, saves and exports full contract without inv
       window.chrome={webview:{addEventListener:(_,fn)=>callback=fn,postMessage:wire=>{
         if(wire.startsWith('JADE_DESIGN_DRAFT\t')){const text=decodeURIComponent(wire.split('\t')[2]);window.lastDraft=text?JSON.parse(text):null;return;}
         const [,id,action,...data]=wire.split('\t').map(decodeURIComponent);window.sent.push({action,data});
-        const fields=action==='design_load'?['','<button id="existing">已有按钮</button>','E:\\test.e']:['已保存'];
+        const fields=action==='design_load'?['','<button id="existing">已有按钮</button>','E:\\test.e']:action==='design_edit_source'?['<button id="existing">已有按钮</button>','https://jade-design-assets.invalid/']:['已保存'];
         queueMicrotask(()=>callback({data:['JADE_TOOL_RESULT',id,'1',...fields.map(encodeURIComponent)].join('\t')}));
       }}};
     });
@@ -138,7 +160,9 @@ test('design workspace edits, drags, saves and exports full contract without inv
     await page.waitForFunction(()=>window.sent.some(m=>m.action==='design_export'));
     const messages=await page.evaluate(()=>window.sent),saved=JSON.parse(messages.find(m=>m.action==='design_save').data[1]);
     assert.equal(saved.nodes[0].columns[0].title,'用户');assert.equal(saved.nodes[0].rowHeight,40);assert.equal(saved.nodes[0].columns.length,4);
-    assert.ok(messages.find(m=>m.action==='design_export').data[1].includes('# AI 生成 UI 与 JadeView 易语言支持库对接规范'));
+    const task=messages.find(m=>m.action==='design_export').data[1];
+    assert.match(task,/新增：/);assert.match(task,/"kind":"super-list"/);
+    assert.doesNotMatch(task,/## 设计稿|完整对接规范（构建时/);
     assert.equal(await page.evaluate(()=>window.lastDraft),null);
     await page.getByRole('button',{name:'关闭',exact:true}).click();
     await mkdir('../artifacts/design-workspace',{recursive:true});

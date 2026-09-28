@@ -21,10 +21,11 @@ export const PRESETS={
   ellipse:{label:'椭圆',kind:'container',width:120,height:120,style:{radius:100}}
 };
 export const COMPONENT_GROUPS=[
+  ['文字',['label','heading','badge']],
   ['按钮',['button','icon-button','outline-button','tonal-button','text-button','floating-button']],
   ['操作与输入',['edit','textarea','password','search','select','checkbox','radio','switch','number','slider']],
   ['数据与导航',['super-list','tree','tabs','sidebar','navigation-rail']],
-  ['内容与反馈',['label','heading','badge','progress']],
+  ['状态与反馈',['progress']],
   ['布局与形状',['container','card','toolbar','dialog','divider','rectangle','ellipse']]
 ];
 export const NAV_ICONS={house:'首页',search:'搜索',heart:'收藏',settings:'设置',user:'用户',bell:'通知',folder:'文件',chart:'统计'};
