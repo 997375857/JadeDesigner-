@@ -5,7 +5,7 @@
 | 文件 | 大小 (字节) | SHA256 | 说明 |
 | --- | --- | --- | --- |
 | `JadeView_v2.4.0-beta.1.26H01.e` | 705941 | `42638F5D71D6EBE4BF71AB9BFD70713D81F12F9D89BD72DD660F513C551AF5B6` | 易语言工程源码，文件头 `CNWTEPRG` |
-| `JadeView_x64.dll` | 4043776 | `7BCB636EDD9E8BD69C71B9D3AF845DE51585D09BC3F016AAC49B0E4F67E9ED59` | JadeView 运行时，x64 |
+| `JadeView_x86.dll` | 3426304 | `A20D2EE4F97112958E57B64CDA0AF7E64DD7199EA51F393183BF0B084EE6B014` | JadeView 运行时，x86 |
 
 ## `.e` 工程里包含什么
 
@@ -20,15 +20,17 @@
 ## 使用
 
 1. 用易语言打开 `JadeView_v2.4.0-beta.1.26H01.e`。
-2. 按目标程序位数放置对应运行时：工程内声明的是 **`JadeView_x86.dll`**，而本目录附带的是 **`JadeView_x64.dll`**。32 位易语言程序用 x86 运行时；x64 目标需要把声明中的 DLL 名一并改掉，不能只换文件。
+2. 把 `JadeView_x86.dll` 放在生成的 exe 同目录（或按工程内的加载路径放置）。工程内 129 处声明写的都是 **`JadeView_x86.dll`**，随机附的这份 x86 运行时一致，直接配对即可。
+   - 易语言编译目标是 32 位，用 x86 运行时是正确选择。
+   - 若确实要出 x64 版本，需要换成 x64 的 JadeView 运行时，**并把声明里的 DLL 名一并改掉**，不能只替换文件。
 3. 网页资源按仓库 `web/index.html` 的组织方式放在工程目录下。
 
-## 两处版本不一致，联调前先确认
+## 版本批次不一致，联调前先确认
 
 | 项 | 标称 | 实际 |
 | --- | --- | --- |
 | 工程文件名 | `2.4.0-beta.1.26H01` | — |
-| `JadeView_x64.dll` 文件版本 | — | `2.4.2.26I01`（`ProductName: JadeView`，`CompanyName: JadeView Team`，`FileDescription: JadeView WebView`） |
+| `JadeView_x86.dll` 文件版本 | — | `2.4.2.26I01`（`ProductName: JadeView`，`CompanyName: JadeView Team`，`FileDescription: JadeView WebView`） |
 
 工程名与运行时的构建批次不同。联调时以实际加载到的 DLL 版本为准；要严格对齐，替换为同名版本的 JadeView 运行时。
 

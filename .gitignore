@@ -60,4 +60,4 @@ Release/
 
 # JadeView 侧工程与运行时（examples/ 下原样发布）
 !/examples/JadeView_v2.4.0-beta.1.26H01.e
-!/examples/JadeView_x64.dll
+!/examples/JadeView_x86.dll
