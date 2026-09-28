@@ -57,3 +57,7 @@ Release/
 !/docs/0908版本说明.md
 !/docs/AI生成UI与JadeView支持库对接规范.md
 !/docs/Jade设计工作区.md
+
+# JadeView 侧工程与运行时（examples/ 下原样发布）
+!/examples/JadeView_v2.4.0-beta.1.26H01.e
+!/examples/JadeView_x64.dll
